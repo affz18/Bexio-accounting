@@ -1,8 +1,38 @@
-node_modules/
-build/
-dist/
-coverage/
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual Environments
+venv/
+env/
+ENV/
+.venv/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ENV - niemals committen!
+.env
+.env.local
+.env.production
+
+# OS
 .DS_Store
+Thumbs.db
+
+# Logs
 *.log
-.env*
-!.env.example
+logs/
+
+# Railway / Deployment
+.railway/
