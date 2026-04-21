@@ -1,0 +1,21 @@
+# Telegram Bot (async)
+python-telegram-bot[job-queue]>=21.6
+
+# Supabase
+supabase>=2.9.0
+
+# Google Gemini (NEW unified SDK)
+google-genai>=0.3.0
+
+# HTTP Client (fuer Bexio API)
+httpx>=0.27.0
+
+# Config & Validation
+pydantic>=2.9.0
+pydantic-settings>=2.5.0
+
+# ENV handling
+python-dotenv>=1.0.1
+
+# Logging (strukturiert, nice to have)
+structlog>=24.4.0

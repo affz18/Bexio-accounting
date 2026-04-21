@@ -1,11 +1,23 @@
-<div align="center">
+# VisioSkin Accounting Agent
 
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
+Ein Telegram-Bot, der eingehende Rechnungen via Google Gemini auswertet und in Bexio verbucht.
 
-  <h1>Built with AI Studio</h2>
+## Setup
+1. Erstelle eine Python 3.11 Umgebung: `python -m venv venv`
+2. Aktiviere sie: `source venv/bin/activate` (Mac/Linux) oder `venv\Scripts\activate` (Windows)
+3. Installiere Abhängigkeiten: `pip install -r requirements.txt`
+4. Kopiere `.env.example` zu `.env` und fülle die Variablen aus.
+5. Starte den Bot: `python -m app.main` oder `fastapi run app/main.py --port 3000`
 
-  <p>The fastest path from prompt to production with Gemini.</p>
+## Supabase Tabellen
+Bitte stelle sicher, dass folgende Tabellen existieren:
+- `vendors`
+- `pending_invoices`
+- `authorized_users`
+- Storage Bucket: `invoices`
 
-  <a href="https://aistudio.google.com/apps">Start building</a>
-
-</div>
+## Deployment auf Railway
+- Projekt mit GitHub verbinden
+- "Nixpacks" wird automatisch erkannt
+- ENV-Variablen in Railway setzen
+- Das `Procfile` startet den Bot als Worker. Alternativ als Web-Service mit Port (dann wird FastAPI health endpoint genutzt).
