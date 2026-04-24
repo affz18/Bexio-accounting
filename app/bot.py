@@ -315,6 +315,16 @@ async def _process_invoice_file(
         
         try:
             result = await gemini.extract_invoice(file_bytes, mime_type)
+        except gemini.GeminiOverloadedError as e:
+            db.mark_invoice_failed(invoice_id, f"Gemini ueberlastet: {e}")
+            db.log_action(invoice_id, "extraction_failed", details={"error": str(e), "reason": "overloaded"})
+            await status_msg.edit_text(
+                "⏳ *Gemini ist gerade ueberlastet*\n\n"
+                "Die Google-Server haben hohe Auslastung. "
+                "Bitte schick die Rechnung in 2-3 Minuten nochmal.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
         except gemini.GeminiError as e:
             db.mark_invoice_failed(invoice_id, f"Gemini-Fehler: {e}")
             db.log_action(invoice_id, "extraction_failed", details={"error": str(e)})
@@ -745,6 +755,7 @@ async def _create_bexio_bill(invoice: dict) -> Optional[dict]:
     # Bill erstellen
     bill = await bexio_module.bexio.create_supplier_bill(
         vendor_bexio_id=bexio_contact_id,
+        vendor_name=vendor_name,
         vendor_reference=invoice.get("invoice_number") or "—",
         bill_date=bill_date,
         due_date=due_date,
@@ -753,8 +764,6 @@ async def _create_bexio_bill(invoice: dict) -> Optional[dict]:
         tax_id=invoice.get("suggested_tax_id"),
         currency_code=invoice.get("currency") or "CHF",
         title=f"Rechnung {vendor_name}",
-        iban=invoice.get("iban"),
-        qr_reference=invoice.get("reference_number"),
     )
     
     # Vendor-Memory: bexio_contact_id speichern falls neu

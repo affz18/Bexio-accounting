@@ -282,6 +282,7 @@ class BexioClient:
     async def create_supplier_bill(
         self,
         vendor_bexio_id: int,
+        vendor_name: str,
         vendor_reference: str,
         bill_date: str,
         due_date: str,
@@ -290,17 +291,19 @@ class BexioClient:
         tax_id: Optional[int] = None,
         currency_code: str = "CHF",
         title: Optional[str] = None,
-        iban: Optional[str] = None,
-        qr_reference: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
-        Erstellt eine Eingangsrechnung in Bexio.
-        
-        WICHTIG: Die v3 API erwartet eine komplexe Struktur mit 'line_items'.
-        Wir buchen vereinfacht als EINE Position = Gesamtbetrag auf das Konto.
-        
+        Erstellt eine Eingangsrechnung (Kreditor) in Bexio via v4 API.
+
+        Bexio hat den Endpoint fuer Supplier-Bills in v4 verschoben.
+        Der v3-Endpoint existiert nicht mehr und liefert 404.
+
+        Wir buchen vereinfacht als EINE Position = Gesamtbetrag auf das Konto
+        mit manual_amount=false und item_net=false (Betraege inkl. MwSt).
+
         Args:
             vendor_bexio_id: ID des Lieferanten-Kontakts in Bexio
+            vendor_name: Name des Lieferanten (fuer address.lastname_company)
             vendor_reference: Rechnungsnummer des Lieferanten
             bill_date: YYYY-MM-DD
             due_date: YYYY-MM-DD
@@ -309,59 +312,60 @@ class BexioClient:
             tax_id: Bexio-ID des MwSt-Codes
             currency_code: Default CHF
             title: Optionaler Titel der Rechnung
-            iban: IBAN fuer spaetere Zahlung
-            qr_reference: QR-Referenznummer
-        
+
         Returns:
             Das erstellte Bill-Objekt mit neuer ID, oder None bei Fehler.
         """
-        
-        # Payload-Struktur gemaess Bexio v3 API Doku
-        line_item = {
-            "amount": 1,
-            "unit_id": None,
-            "account_id": account_id,
-            "unit_price": round(total_amount, 2),
-            "description": title or f"Rechnung {vendor_reference}",
+        gross_amount = round(total_amount, 2)
+        bill_title = title or f"Rechnung {vendor_reference}"
+
+        line_item: Dict[str, Any] = {
+            "position": 0,
+            "amount": gross_amount,
+            "title": bill_title,
+            "booking_account_id": account_id,
         }
-        
         if tax_id is not None:
             line_item["tax_id"] = tax_id
-        
-        payload = {
-            "contact_id": vendor_bexio_id,
-            "vendor_ref": vendor_reference,
+
+        payload: Dict[str, Any] = {
+            "supplier_id": vendor_bexio_id,
+            # Bexio erwartet contact_partner_id; wenn der Lieferant eine Firma
+            # ohne Ansprechpartner ist, nutzen wir den Supplier-Kontakt selbst.
+            "contact_partner_id": vendor_bexio_id,
+            "currency_code": currency_code,
+            "address": {
+                "lastname_company": vendor_name,
+                "type": "COMPANY",
+            },
             "bill_date": bill_date,
             "due_date": due_date,
-            "currency_code": currency_code,
-            "title": title or f"Rechnung {vendor_reference}",
+            "manual_amount": False,
+            "item_net": False,
             "line_items": [line_item],
+            "discounts": [],
+            "attachment_ids": [],
+            "vendor_ref": vendor_reference,
+            "title": bill_title,
+            "amount_calc": gross_amount,
         }
-        
-        # Optional: IBAN & QR-Referenz fuer spaetere Zahlung
-        if iban:
-            payload["payment"] = {
-                "iban": iban.replace(" ", "").upper(),
-            }
-            if qr_reference:
-                payload["payment"]["qr_reference"] = qr_reference
-        
+
         try:
-            result = await self._request("POST", "/3.0/purchase/bills", json=payload)
+            result = await self._request("POST", "/4.0/purchase/bills", json=payload)
             if result:
                 bill_id = result.get("id")
-                logger.info(f"Bexio Bill erstellt: #{bill_id} fuer Vendor {vendor_bexio_id}, {total_amount} CHF")
+                logger.info(f"Bexio Bill erstellt: #{bill_id} fuer Vendor {vendor_bexio_id}, {gross_amount} CHF")
                 return result
             return None
         except BexioError as e:
             logger.error(f"Fehler beim Bill-Erstellen: {e.response_body or e}")
             # Reraise damit Bot den User informieren kann
             raise
-    
+
     async def get_supplier_bill(self, bill_id: int) -> Optional[Dict[str, Any]]:
         """Holt eine bestehende Bill zur Verifikation."""
         try:
-            return await self._request("GET", f"/3.0/purchase/bills/{bill_id}")
+            return await self._request("GET", f"/4.0/purchase/bills/{bill_id}")
         except BexioError as e:
             logger.error(f"Fehler beim Bill-Abruf {bill_id}: {e}")
             return None

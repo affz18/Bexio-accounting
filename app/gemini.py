@@ -6,6 +6,7 @@ Dokumentation: https://googleapis.github.io/python-genai/
 """
 import asyncio
 import json
+import time
 from typing import Optional, Tuple
 
 from google import genai
@@ -23,6 +24,26 @@ logger = setup_logger(__name__)
 class GeminiError(Exception):
     """Fehler bei der Gemini-Extraktion."""
     pass
+
+
+class GeminiOverloadedError(GeminiError):
+    """Gemini ist ueberlastet (503 UNAVAILABLE). Der User soll spaeter erneut versuchen."""
+    pass
+
+
+# Transient-Fehler die wir retryen: 503 (UNAVAILABLE), 429 (Rate Limit),
+# 500 (Internal), 504 (Gateway Timeout).
+_RETRY_STATUS_TOKENS = ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "500", "504", "DEADLINE_EXCEEDED")
+
+
+def _is_transient_error(exc: Exception) -> bool:
+    msg = str(exc).upper()
+    return any(token in msg for token in _RETRY_STATUS_TOKENS)
+
+
+def _is_overloaded_error(exc: Exception) -> bool:
+    msg = str(exc).upper()
+    return "503" in msg or "UNAVAILABLE" in msg or "OVERLOADED" in msg
 
 
 # =========================================================
@@ -198,34 +219,57 @@ async def extract_invoice(
 def _extract_sync(file_bytes: bytes, mime_type: str) -> InvoiceExtractionResult:
     """Synchrone Extraktion - wird von extract_invoice in Thread gewrappt."""
     client = _get_client()
-    
+
     # File-Part fuer Gemini bauen
     file_part = types.Part.from_bytes(
         data=file_bytes,
         mime_type=mime_type,
     )
-    
+
     user_prompt = (
         "Analysiere dieses Dokument. Extrahiere die Rechnungsdaten gemaess Schema. "
         "Falls es keine Rechnung ist, setze is_invoice auf false."
     )
-    
-    # Request an Gemini
-    try:
-        response = client.models.generate_content(
-            model=settings.gemini_model,
-            contents=[file_part, user_prompt],
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                response_mime_type="application/json",
-                response_schema=RESPONSE_SCHEMA,
-                temperature=0.1,  # deterministischer fuer Extraktionen
-                max_output_tokens=2048,
-            ),
-        )
-    except Exception as e:
-        logger.error(f"Gemini API-Call fehlgeschlagen: {e}")
-        raise GeminiError(f"Gemini API-Fehler: {e}")
+
+    # Request an Gemini mit Retry bei Ueberlastung (503) / Rate-Limit (429).
+    # Gemini Free-Tier ist oft ueberlastet; ein kurzer Backoff reicht meist.
+    max_attempts = 4
+    last_exc: Optional[Exception] = None
+    response = None
+    for attempt in range(max_attempts):
+        try:
+            response = client.models.generate_content(
+                model=settings.gemini_model,
+                contents=[file_part, user_prompt],
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    response_mime_type="application/json",
+                    response_schema=RESPONSE_SCHEMA,
+                    temperature=0.1,
+                    max_output_tokens=2048,
+                ),
+            )
+            break
+        except Exception as e:
+            last_exc = e
+            if _is_transient_error(e) and attempt < max_attempts - 1:
+                wait = 2 ** attempt + 1  # 2, 3, 5, 9 Sekunden
+                logger.warning(
+                    f"Gemini transient error (Versuch {attempt + 1}/{max_attempts}): {e} "
+                    f"- retry in {wait}s"
+                )
+                time.sleep(wait)
+                continue
+            logger.error(f"Gemini API-Call fehlgeschlagen: {e}")
+            if _is_overloaded_error(e):
+                raise GeminiOverloadedError(
+                    "Gemini ist gerade ueberlastet. Bitte in ein paar Minuten erneut versuchen."
+                )
+            raise GeminiError(f"Gemini API-Fehler: {e}")
+
+    if response is None:
+        # Sollte unerreichbar sein, aber sauber fallen lassen
+        raise GeminiError(f"Gemini API-Fehler: {last_exc}")
     
     # Response parsen
     raw_text = response.text
@@ -366,19 +410,36 @@ Schlage EIN passendes Konto vor. Antworte NUR mit JSON:
 
 
 def _suggest_sync(prompt: str) -> dict:
-    """Synchroner Teil des Vorschlag-Calls."""
+    """Synchroner Teil des Vorschlag-Calls (mit Retry bei 503/429)."""
     client = _get_client()
-    
-    response = client.models.generate_content(
-        model=settings.gemini_model,
-        contents=[prompt],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            temperature=0.2,
-            max_output_tokens=512,
-        ),
-    )
-    
+
+    max_attempts = 3
+    response = None
+    last_exc: Optional[Exception] = None
+    for attempt in range(max_attempts):
+        try:
+            response = client.models.generate_content(
+                model=settings.gemini_model,
+                contents=[prompt],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.2,
+                    max_output_tokens=512,
+                ),
+            )
+            break
+        except Exception as e:
+            last_exc = e
+            if _is_transient_error(e) and attempt < max_attempts - 1:
+                time.sleep(2 ** attempt + 1)
+                continue
+            logger.warning(f"Gemini suggest-Call fehlgeschlagen: {e}")
+            return {}
+
+    if response is None:
+        logger.warning(f"Gemini suggest-Call ohne Response: {last_exc}")
+        return {}
+
     try:
         return json.loads(response.text)
     except json.JSONDecodeError:
