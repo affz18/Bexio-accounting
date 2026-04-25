@@ -387,15 +387,38 @@ class BexioClient:
 
     async def _book_bill_with_retry(self, bill_id: str) -> None:
         """
-        Transitioniert Bill von DRAFT auf BOOKED mit Retry-Logik.
-        Bexio braucht teils 1-2s bis die neu erstellte Bill am Booking-Endpoint
-        verfuegbar ist - daher 404 als transient behandeln.
+        Transitioniert Bill von DRAFT auf BOOKED.
+
+        Strategien (jede mit Backoff bei 404, da Bexio nach dem Create kurz
+        Zeit braucht bis die Sub-Resource aktiv ist):
+          1. PUT /4.0/purchase/bills/{id}/bookings/BOOKED mit explizit leerem
+             {} Body (manche API-Gateways 404en wenn Content-Type:json gesetzt
+             ist aber kein Body mitkommt)
+          2. PUT ohne Body (wie die meisten SDKs es machen)
+        Andere Status-Codes als 404 werfen sofort.
         """
         path = f"/4.0/purchase/bills/{bill_id}/bookings/BOOKED"
-        # Sofort erster Versuch, dann backoff bei 404
         delays = (0.0, 1.5, 3.0, 5.0)
+
+        # Strategie 1: leerer JSON-Body
         last_err: Optional[BexioError] = None
         for delay in delays:
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                await self._request("PUT", path, json={})
+                return
+            except BexioError as e:
+                last_err = e
+                if e.status_code != 404:
+                    raise
+                logger.warning(
+                    f"Booking-Transition 404 (mit empty-body) fuer Bill {bill_id} "
+                    f"- retry nach {delay}s"
+                )
+
+        # Strategie 2: kein Body (Standard-SDK-Pattern)
+        for delay in (0.0, 2.0):
             if delay:
                 await asyncio.sleep(delay)
             try:
@@ -406,19 +429,20 @@ class BexioClient:
                 if e.status_code != 404:
                     raise
                 logger.warning(
-                    f"Booking-Transition 404 fuer Bill {bill_id}, retry nach {delay}s"
+                    f"Booking-Transition 404 (ohne body) fuer Bill {bill_id}"
                 )
-        # Nach allen Retries: 404-Diagnose. Versuch GET um zu sehen ob die
-        # Bill ueberhaupt existiert - hilft beim Debugging.
+
+        # Diagnose: existiert die Bill ueberhaupt?
         try:
             detail = await self._request("GET", f"/4.0/purchase/bills/{bill_id}")
             current_status = (detail or {}).get("status") if isinstance(detail, dict) else None
             logger.error(
                 f"Bill {bill_id} existiert (status={current_status}), "
-                f"Booking-Endpoint gibt aber 404 zurueck."
+                f"Booking-Endpoint persistent 404."
             )
         except Exception as e:
-            logger.error(f"Bill {bill_id} GET nach 404-Booking auch fehlgeschlagen: {e}")
+            logger.error(f"Bill {bill_id} GET nach 404 auch fehlgeschlagen: {e}")
+
         if last_err:
             raise last_err
 
