@@ -362,13 +362,57 @@ class BexioClient:
             # Reraise damit Bot den User informieren kann
             raise
 
-    async def get_supplier_bill(self, bill_id: int) -> Optional[Dict[str, Any]]:
+    async def get_supplier_bill(self, bill_id) -> Optional[Dict[str, Any]]:
         """Holt eine bestehende Bill zur Verifikation."""
         try:
             return await self._request("GET", f"/4.0/purchase/bills/{bill_id}")
         except BexioError as e:
             logger.error(f"Fehler beim Bill-Abruf {bill_id}: {e}")
             return None
+
+    async def list_supplier_bills_page(
+        self,
+        page: int = 1,
+        limit: int = 500,
+        bill_date_start: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Listet Supplier-Bills paginiert (v4).
+        Returns: {"data": [BillListItem...], "paging": {...}}
+        WICHTIG: list-items enthalten KEINE line_items / supplier_id - dafuer
+        get_supplier_bill(id) nutzen.
+        """
+        params: Dict[str, Any] = {
+            "limit": limit,
+            "page": page,
+            "order": "desc",
+            "sort": "bill_date",
+        }
+        if bill_date_start:
+            params["bill_date_start"] = bill_date_start
+        result = await self._request("GET", "/4.0/purchase/bills", params=params)
+        if isinstance(result, dict):
+            return result
+        if isinstance(result, list):
+            # Falls Bexio mal ohne Envelope antwortet
+            return {"data": result, "paging": {}}
+        return {"data": [], "paging": {}}
+
+    async def list_contacts_page(
+        self,
+        offset: int = 0,
+        limit: int = 2000,
+    ) -> List[Dict[str, Any]]:
+        """Listet Kontakte paginiert (v2, offset-basiert)."""
+        try:
+            result = await self._request(
+                "GET", "/2.0/contact",
+                params={"limit": limit, "offset": offset, "order_by": "id"},
+            )
+            return result if isinstance(result, list) else []
+        except BexioError as e:
+            logger.error(f"Fehler beim Contact-Listing offset={offset}: {e}")
+            return []
     
     # =========================================================
     # BANK-KONTEN (fuer Payment-Info)

@@ -97,6 +97,27 @@ def find_vendor_by_name(name: str) -> Optional[VendorMemory]:
         return None
 
 
+def find_vendor_by_bexio_contact_id(bexio_contact_id: int) -> Optional[VendorMemory]:
+    """Sucht Vendor ueber die Bexio-Contact-ID (eindeutige Verknuepfung)."""
+    if not bexio_contact_id:
+        return None
+    try:
+        result = (
+            get_client()
+            .table("vendors")
+            .select("*")
+            .eq("bexio_contact_id", bexio_contact_id)
+            .limit(1)
+            .execute()
+        )
+        if result.data:
+            return VendorMemory(**result.data[0])
+        return None
+    except Exception as e:
+        logger.error(f"Fehler beim Vendor-Lookup bexio_contact_id={bexio_contact_id}: {e}")
+        return None
+
+
 def find_vendor_by_iban(iban: str) -> Optional[VendorMemory]:
     """Fallback-Suche ueber IBAN falls Name nicht exakt matcht."""
     if not iban:
@@ -215,6 +236,87 @@ def update_vendor_mapping(
     except Exception as e:
         logger.error(f"Fehler beim Update Vendor-Mapping: {e}")
         return False
+
+
+def upsert_vendor_from_history(
+    bexio_contact_id: int,
+    name: str,
+    default_account_id: int,
+    default_account_nr: Optional[str] = None,
+    default_tax_id: Optional[int] = None,
+    default_tax_rate: Optional[float] = None,
+    booking_count: int = 1,
+    last_booked_at: Optional[str] = None,
+    iban: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Upsert eines Vendors basierend auf Bexio-History.
+    Returns: "created" | "updated" | "skipped" | None bei Fehler.
+
+    Conflict-Resolution:
+    - Existiert vendor mit diesem bexio_contact_id ODER gleichem normalisierten
+      Name: nur ueberschreiben wenn Bexio-History eine hoehere Confidence
+      ergibt als die bisher gespeicherte (manuelle Korrekturen bleiben erhalten).
+    - bexio_contact_id, name und last_booked_at werden immer aktualisiert.
+    """
+    bexio_confidence = min(0.50 + (booking_count * 0.05), 0.95)
+
+    existing = find_vendor_by_bexio_contact_id(bexio_contact_id) or find_vendor_by_name(name)
+
+    base_payload: Dict[str, Any] = {
+        "name": name,
+        "normalized_name": normalize_vendor_name(name),
+        "bexio_contact_id": bexio_contact_id,
+    }
+    if iban:
+        base_payload["iban"] = iban.replace(" ", "").upper()
+    if last_booked_at:
+        # YYYY-MM-DD oder ISO-String akzeptieren
+        if "T" in last_booked_at:
+            base_payload["last_booked_at"] = last_booked_at
+        else:
+            base_payload["last_booked_at"] = f"{last_booked_at}T00:00:00+00:00"
+
+    mapping_payload: Dict[str, Any] = {
+        "default_account_id": default_account_id,
+        "default_account_nr": default_account_nr,
+        "default_tax_id": default_tax_id,
+        "default_tax_rate": default_tax_rate,
+        "booking_count": booking_count,
+        "confidence_score": bexio_confidence,
+    }
+
+    try:
+        if existing:
+            existing_conf = existing.confidence_score or 0.0
+            payload = {**base_payload}
+            if bexio_confidence > existing_conf:
+                payload.update(mapping_payload)
+                action = "updated"
+            else:
+                action = "skipped"
+            payload = {k: v for k, v in payload.items() if v is not None}
+            (
+                get_client()
+                .table("vendors")
+                .update(payload)
+                .eq("id", existing.id)
+                .execute()
+            )
+            return action
+
+        payload = {**base_payload, **mapping_payload}
+        payload = {k: v for k, v in payload.items() if v is not None}
+        (
+            get_client()
+            .table("vendors")
+            .insert(payload)
+            .execute()
+        )
+        return "created"
+    except Exception as e:
+        logger.error(f"Fehler beim History-Upsert Vendor '{name}': {e}")
+        return None
 
 
 def list_vendors(limit: int = 50) -> List[VendorMemory]:
