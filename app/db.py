@@ -485,8 +485,15 @@ def get_input_tax_codes() -> List[Dict[str, Any]]:
         return []
 
 
-def find_tax_by_rate(rate: float) -> Optional[Dict[str, Any]]:
-    """Findet den MwSt-Code fuer einen bestimmten Satz (z.B. 8.1)."""
+def find_tax_by_rate(rate: float, tax_type: str = "pre_tax") -> Optional[Dict[str, Any]]:
+    """
+    Findet den passenden MwSt-Code fuer einen Satz (z.B. 8.1).
+
+    Standard-Filter: tax_type='pre_tax' (Vorsteuer fuer Einkaeufe).
+    Wuerde man hier nicht filtern, koennte der Lookup bei gleichem Satz
+    auch eine Verkaufs-MwSt liefern, was Bexio dann mit
+    PURCHASES.VALIDATION.TAX_INCORRECT ablehnt.
+    """
     try:
         # Toleranz von 0.1% fuer Rundungsfehler
         result = (
@@ -495,13 +502,14 @@ def find_tax_by_rate(rate: float) -> Optional[Dict[str, Any]]:
             .select("*")
             .gte("tax_rate", rate - 0.05)
             .lte("tax_rate", rate + 0.05)
+            .eq("tax_type", tax_type)
             .eq("is_active", True)
             .limit(1)
             .execute()
         )
         return result.data[0] if result.data else None
     except Exception as e:
-        logger.error(f"Fehler beim Tax-Lookup fuer Rate {rate}: {e}")
+        logger.error(f"Fehler beim Tax-Lookup fuer Rate {rate} ({tax_type}): {e}")
         return None
 
 
