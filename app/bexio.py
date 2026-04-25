@@ -375,9 +375,15 @@ class BexioClient:
                     f"Bill #{bill_id} als DRAFT erstellt, aber Buchungs-Transition "
                     f"fehlgeschlagen: status={book_err.status_code} body={body}"
                 )
+                hint = ""
+                if book_err.status_code == 404:
+                    hint = (
+                        "\nHaeufige Ursache: Belegdatum liegt im geschlossenen "
+                        "Geschaeftsjahr in Bexio."
+                    )
                 raise BexioError(
                     f"Bill als DRAFT erstellt (ID {bill_id}), Buchung fehlgeschlagen. "
-                    f"Bitte in Bexio manuell buchen oder loeschen.\n"
+                    f"Bitte in Bexio manuell buchen oder loeschen.{hint}\n"
                     f"HTTP {book_err.status_code}: {truncate(body, 200)}",
                     status_code=book_err.status_code,
                     response_body=book_err.response_body,

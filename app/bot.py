@@ -805,11 +805,28 @@ async def _create_bexio_bill(invoice: dict) -> Optional[dict]:
     if not bexio_contact_id:
         raise bexio_module.BexioError(f"Konnte Lieferant '{vendor_name}' nicht in Bexio anlegen")
     
-    # Datumsfelder
+    # Datumsfelder. Wenn das Belegdatum im geschlossenen Geschaeftsjahr liegt,
+    # lehnt Bexio das Booking ab (kommt als 404 zurueck, nicht als 422).
+    # Wir clampen daher: alles vor dem 1.1. des aktuellen Jahres -> heute.
     today = datetime.now(timezone.utc).date()
-    bill_date = invoice.get("invoice_date") or today.isoformat()
-    due_date = invoice.get("due_date") or (today + timedelta(days=30)).isoformat()
-    
+    start_of_year = today.replace(month=1, day=1).isoformat()
+    extracted_date = invoice.get("invoice_date")
+    extracted_due = invoice.get("due_date")
+
+    if extracted_date and extracted_date < start_of_year:
+        logger.info(
+            f"Belegdatum {extracted_date} liegt im geschlossenen Geschaeftsjahr "
+            f"- clamp auf heute ({today.isoformat()})"
+        )
+        bill_date = today.isoformat()
+        due_date = (today + timedelta(days=30)).isoformat()
+    else:
+        bill_date = extracted_date or today.isoformat()
+        if extracted_due and extracted_due >= bill_date:
+            due_date = extracted_due
+        else:
+            due_date = (today + timedelta(days=30)).isoformat()
+
     # Bill erstellen
     bill = await bexio_module.bexio.create_supplier_bill(
         vendor_bexio_id=bexio_contact_id,
