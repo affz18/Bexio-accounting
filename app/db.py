@@ -275,13 +275,21 @@ def sync_accounts(accounts: List[Dict[str, Any]]) -> int:
 
 
 def _account_type_label(type_id: Optional[int]) -> str:
-    """Bexio Account-Type IDs zu Labels mappen."""
+    """
+    Bexio Account-Type IDs zu Labels mappen.
+    Canonical Bexio mapping (nicht was man intuitiv erwartet!):
+      1 = EARNINGS         -> Ertrag (income)
+      2 = EXPENDITURES     -> Aufwand (expense)
+      3 = ACTIVE_ACCOUNTS  -> Aktiven (asset)
+      4 = PASSIVE_ACCOUNTS -> Passiven (liability, inkl. Eigenkapital)
+      5 = COMPLETE_ACCOUNTS-> Abschlusskonten 9xxx (closing)
+    """
     mapping = {
-        1: "asset",
-        2: "liability",
-        3: "equity",
-        4: "income",
-        5: "expense",
+        1: "income",
+        2: "expense",
+        3: "asset",
+        4: "liability",
+        5: "closing",
     }
     return mapping.get(type_id, "unknown")
 
