@@ -8,7 +8,7 @@ from typing import Optional, List, Dict, Any
 import httpx
 
 from app.config import settings
-from app.utils import setup_logger, normalize_vendor_name
+from app.utils import setup_logger, normalize_vendor_name, truncate
 
 
 logger = setup_logger(__name__)
@@ -319,6 +319,12 @@ class BexioClient:
         gross_amount = round(total_amount, 2)
         bill_title = title or f"Rechnung {vendor_reference}"
 
+        # contact_partner_id ist NICHT der Lieferant, sondern der interne
+        # Bexio-User (Mitarbeiter), der die Bill verantwortet. Wenn wir hier
+        # die supplier_id nehmen, zeigt Bexio den Mandanten als Absender und
+        # wirft beim Booking 400.
+        owner_user_id = await self._get_current_user_id()
+
         line_item: Dict[str, Any] = {
             "position": 0,
             "amount": gross_amount,
@@ -330,9 +336,7 @@ class BexioClient:
 
         payload: Dict[str, Any] = {
             "supplier_id": vendor_bexio_id,
-            # Bexio erwartet contact_partner_id; wenn der Lieferant eine Firma
-            # ohne Ansprechpartner ist, nutzen wir den Supplier-Kontakt selbst.
-            "contact_partner_id": vendor_bexio_id,
+            "contact_partner_id": owner_user_id,
             "currency_code": currency_code,
             "address": {
                 "lastname_company": vendor_name,
@@ -367,22 +371,90 @@ class BexioClient:
         # damit die Buchung in der Buchhaltung landet.
         if bill_id:
             try:
-                await self._request("PUT", f"/4.0/purchase/bills/{bill_id}/bookings/BOOKED")
+                await self._book_bill_with_retry(bill_id)
                 logger.info(f"Bexio Bill #{bill_id} auf BOOKED transitioned")
             except BexioError as book_err:
+                body = book_err.response_body or "(kein Body)"
                 logger.error(
                     f"Bill #{bill_id} als DRAFT erstellt, aber Buchungs-Transition "
-                    f"fehlgeschlagen: {book_err.response_body or book_err}"
+                    f"fehlgeschlagen: status={book_err.status_code} body={body}"
                 )
+                hint = ""
+                if book_err.status_code == 404:
+                    hint = (
+                        "\nHaeufige Ursache: Belegdatum liegt im geschlossenen "
+                        "Geschaeftsjahr in Bexio."
+                    )
                 raise BexioError(
-                    f"Bill als DRAFT erstellt (ID {bill_id}), aber automatische Buchung "
-                    f"fehlgeschlagen. Bitte in Bexio manuell buchen oder loeschen. "
-                    f"Detail: {book_err}",
+                    f"Bill als DRAFT erstellt (ID {bill_id}), Buchung fehlgeschlagen. "
+                    f"Bitte in Bexio manuell buchen oder loeschen.{hint}\n"
+                    f"HTTP {book_err.status_code}: {truncate(body, 200)}",
                     status_code=book_err.status_code,
                     response_body=book_err.response_body,
                 )
 
         return result
+
+    async def _book_bill_with_retry(self, bill_id: str) -> None:
+        """
+        Transitioniert Bill von DRAFT auf BOOKED.
+
+        Strategien (jede mit Backoff bei 404, da Bexio nach dem Create kurz
+        Zeit braucht bis die Sub-Resource aktiv ist):
+          1. PUT /4.0/purchase/bills/{id}/bookings/BOOKED mit explizit leerem
+             {} Body (manche API-Gateways 404en wenn Content-Type:json gesetzt
+             ist aber kein Body mitkommt)
+          2. PUT ohne Body (wie die meisten SDKs es machen)
+        Andere Status-Codes als 404 werfen sofort.
+        """
+        path = f"/4.0/purchase/bills/{bill_id}/bookings/BOOKED"
+        delays = (0.0, 1.5, 3.0, 5.0)
+
+        # Strategie 1: leerer JSON-Body
+        last_err: Optional[BexioError] = None
+        for delay in delays:
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                await self._request("PUT", path, json={})
+                return
+            except BexioError as e:
+                last_err = e
+                if e.status_code != 404:
+                    raise
+                logger.warning(
+                    f"Booking-Transition 404 (mit empty-body) fuer Bill {bill_id} "
+                    f"- retry nach {delay}s"
+                )
+
+        # Strategie 2: kein Body (Standard-SDK-Pattern)
+        for delay in (0.0, 2.0):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                await self._request("PUT", path)
+                return
+            except BexioError as e:
+                last_err = e
+                if e.status_code != 404:
+                    raise
+                logger.warning(
+                    f"Booking-Transition 404 (ohne body) fuer Bill {bill_id}"
+                )
+
+        # Diagnose: existiert die Bill ueberhaupt?
+        try:
+            detail = await self._request("GET", f"/4.0/purchase/bills/{bill_id}")
+            current_status = (detail or {}).get("status") if isinstance(detail, dict) else None
+            logger.error(
+                f"Bill {bill_id} existiert (status={current_status}), "
+                f"Booking-Endpoint persistent 404."
+            )
+        except Exception as e:
+            logger.error(f"Bill {bill_id} GET nach 404 auch fehlgeschlagen: {e}")
+
+        if last_err:
+            raise last_err
 
     async def get_supplier_bill(self, bill_id) -> Optional[Dict[str, Any]]:
         """Holt eine bestehende Bill zur Verifikation."""
