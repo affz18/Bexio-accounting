@@ -8,7 +8,7 @@ from typing import Optional, List, Dict, Any
 import httpx
 
 from app.config import settings
-from app.utils import setup_logger, normalize_vendor_name
+from app.utils import setup_logger, normalize_vendor_name, truncate
 
 
 logger = setup_logger(__name__)
@@ -367,22 +367,60 @@ class BexioClient:
         # damit die Buchung in der Buchhaltung landet.
         if bill_id:
             try:
-                await self._request("PUT", f"/4.0/purchase/bills/{bill_id}/bookings/BOOKED")
+                await self._book_bill_with_retry(bill_id)
                 logger.info(f"Bexio Bill #{bill_id} auf BOOKED transitioned")
             except BexioError as book_err:
+                body = book_err.response_body or "(kein Body)"
                 logger.error(
                     f"Bill #{bill_id} als DRAFT erstellt, aber Buchungs-Transition "
-                    f"fehlgeschlagen: {book_err.response_body or book_err}"
+                    f"fehlgeschlagen: status={book_err.status_code} body={body}"
                 )
                 raise BexioError(
-                    f"Bill als DRAFT erstellt (ID {bill_id}), aber automatische Buchung "
-                    f"fehlgeschlagen. Bitte in Bexio manuell buchen oder loeschen. "
-                    f"Detail: {book_err}",
+                    f"Bill als DRAFT erstellt (ID {bill_id}), Buchung fehlgeschlagen. "
+                    f"Bitte in Bexio manuell buchen oder loeschen.\n"
+                    f"HTTP {book_err.status_code}: {truncate(body, 200)}",
                     status_code=book_err.status_code,
                     response_body=book_err.response_body,
                 )
 
         return result
+
+    async def _book_bill_with_retry(self, bill_id: str) -> None:
+        """
+        Transitioniert Bill von DRAFT auf BOOKED mit Retry-Logik.
+        Bexio braucht teils 1-2s bis die neu erstellte Bill am Booking-Endpoint
+        verfuegbar ist - daher 404 als transient behandeln.
+        """
+        path = f"/4.0/purchase/bills/{bill_id}/bookings/BOOKED"
+        # Sofort erster Versuch, dann backoff bei 404
+        delays = (0.0, 1.5, 3.0, 5.0)
+        last_err: Optional[BexioError] = None
+        for delay in delays:
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                await self._request("PUT", path)
+                return
+            except BexioError as e:
+                last_err = e
+                if e.status_code != 404:
+                    raise
+                logger.warning(
+                    f"Booking-Transition 404 fuer Bill {bill_id}, retry nach {delay}s"
+                )
+        # Nach allen Retries: 404-Diagnose. Versuch GET um zu sehen ob die
+        # Bill ueberhaupt existiert - hilft beim Debugging.
+        try:
+            detail = await self._request("GET", f"/4.0/purchase/bills/{bill_id}")
+            current_status = (detail or {}).get("status") if isinstance(detail, dict) else None
+            logger.error(
+                f"Bill {bill_id} existiert (status={current_status}), "
+                f"Booking-Endpoint gibt aber 404 zurueck."
+            )
+        except Exception as e:
+            logger.error(f"Bill {bill_id} GET nach 404-Booking auch fehlgeschlagen: {e}")
+        if last_err:
+            raise last_err
 
     async def get_supplier_bill(self, bill_id) -> Optional[Dict[str, Any]]:
         """Holt eine bestehende Bill zur Verifikation."""
