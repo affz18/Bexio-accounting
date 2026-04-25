@@ -319,6 +319,12 @@ class BexioClient:
         gross_amount = round(total_amount, 2)
         bill_title = title or f"Rechnung {vendor_reference}"
 
+        # contact_partner_id ist NICHT der Lieferant, sondern der interne
+        # Bexio-User (Mitarbeiter), der die Bill verantwortet. Wenn wir hier
+        # die supplier_id nehmen, zeigt Bexio den Mandanten als Absender und
+        # wirft beim Booking 400.
+        owner_user_id = await self._get_current_user_id()
+
         line_item: Dict[str, Any] = {
             "position": 0,
             "amount": gross_amount,
@@ -330,9 +336,7 @@ class BexioClient:
 
         payload: Dict[str, Any] = {
             "supplier_id": vendor_bexio_id,
-            # Bexio erwartet contact_partner_id; wenn der Lieferant eine Firma
-            # ohne Ansprechpartner ist, nutzen wir den Supplier-Kontakt selbst.
-            "contact_partner_id": vendor_bexio_id,
+            "contact_partner_id": owner_user_id,
             "currency_code": currency_code,
             "address": {
                 "lastname_company": vendor_name,
