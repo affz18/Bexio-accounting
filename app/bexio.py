@@ -352,15 +352,37 @@ class BexioClient:
 
         try:
             result = await self._request("POST", "/4.0/purchase/bills", json=payload)
-            if result:
-                bill_id = result.get("id")
-                logger.info(f"Bexio Bill erstellt: #{bill_id} fuer Vendor {vendor_bexio_id}, {gross_amount} CHF")
-                return result
-            return None
         except BexioError as e:
             logger.error(f"Fehler beim Bill-Erstellen: {e.response_body or e}")
-            # Reraise damit Bot den User informieren kann
             raise
+
+        if not result:
+            return None
+
+        bill_id = result.get("id")
+        logger.info(f"Bexio Bill erstellt (DRAFT): #{bill_id} fuer Vendor {vendor_bexio_id}, {gross_amount} CHF")
+
+        # Bexio v4 erstellt die Bill als DRAFT - sie ist im UI sichtbar aber
+        # NICHT im Kontenblatt verbucht. Wir transitionen direkt auf BOOKED,
+        # damit die Buchung in der Buchhaltung landet.
+        if bill_id:
+            try:
+                await self._request("PUT", f"/4.0/purchase/bills/{bill_id}/bookings/BOOKED")
+                logger.info(f"Bexio Bill #{bill_id} auf BOOKED transitioned")
+            except BexioError as book_err:
+                logger.error(
+                    f"Bill #{bill_id} als DRAFT erstellt, aber Buchungs-Transition "
+                    f"fehlgeschlagen: {book_err.response_body or book_err}"
+                )
+                raise BexioError(
+                    f"Bill als DRAFT erstellt (ID {bill_id}), aber automatische Buchung "
+                    f"fehlgeschlagen. Bitte in Bexio manuell buchen oder loeschen. "
+                    f"Detail: {book_err}",
+                    status_code=book_err.status_code,
+                    response_body=book_err.response_body,
+                )
+
+        return result
 
     async def get_supplier_bill(self, bill_id) -> Optional[Dict[str, Any]]:
         """Holt eine bestehende Bill zur Verifikation."""
