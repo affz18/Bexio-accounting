@@ -36,6 +36,7 @@ from app.config import settings
 from app.utils import setup_logger, format_chf, truncate, normalize_vendor_name
 from app.models import InvoiceExtractionResult
 from app import db, storage, bexio as bexio_module, gemini
+from app.learn import learn_from_bexio_history, ProgressThrottle
 
 
 logger = setup_logger(__name__)
@@ -91,10 +92,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Schick mir eine Rechnung als PDF oder Foto und ich verbuche sie in Bexio.\n\n"
         "*Befehle:*\n"
         "/sync — Bexio-Kontenplan aktualisieren\n"
+        "/learn — Aus bestehender Bexio-History lernen\n"
         "/stats — Statistik anzeigen\n"
         "/vendors — Gelernte Lieferanten\n"
         "/help — Hilfe\n\n"
-        "_Tipp: Erster Schritt ist `/sync` damit ich deinen Kontenplan kenne._",
+        "_Tipp: Beim ersten Start `/sync` und dann `/learn` ausfuehren._",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -115,6 +117,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "*Was ich lerne:*\n"
         "Jedes Mal wenn du einen Lieferanten bestaetigst, merke ich mir "
         "welches Konto du nutzt. Beim naechsten Mal schlage ich es automatisch vor.\n\n"
+        "*Schon mal in Bexio gebucht?* Mit `/learn` lese ich die letzten 12 "
+        "Monate Bexio-Rechnungen und uebernehme dein bisheriges Buchungsmuster.\n\n"
         "*Bei Problemen:* Schick `/stats` um zu sehen ob Belege haengen geblieben sind.",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -153,6 +157,60 @@ async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"❌ *Fehler beim Sync*\n\n"
             f"`{truncate(str(e), 200)}`\n\n"
             f"Pruefe deinen Bexio API Token.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+
+async def cmd_learn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Lernt Vendor->Konto-Mapping aus bestehender Bexio-History."""
+    if not await _check_auth(update):
+        return
+
+    msg = await update.message.reply_text(
+        "🧠 *Lern-Vorgang gestartet*\n\n"
+        "Ich lese deine letzten 12 Monate Bexio-Rechnungen und baue daraus "
+        "das Lieferanten-Memory auf.\n\n"
+        "_Das kann je nach Anzahl Belege ein paar Minuten dauern._",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    async def _edit(text: str) -> None:
+        await msg.edit_text(f"🧠 {text}")
+
+    progress = ProgressThrottle(_edit, min_interval_s=2.0)
+
+    try:
+        stats = await learn_from_bexio_history(
+            months_back=12,
+            max_bills=1000,
+            progress=progress,
+        )
+        await msg.edit_text(
+            f"✅ *Lern-Vorgang abgeschlossen*\n\n"
+            f"📋 Bills geladen: {stats.bills_listed}\n"
+            f"⚙️ Verarbeitet: {stats.bills_processed}\n"
+            f"⏭ Uebersprungen: {stats.bills_skipped}\n\n"
+            f"🆕 Neue Lieferanten: {stats.vendors_created}\n"
+            f"🔄 Aktualisierte: {stats.vendors_updated}\n"
+            f"➖ Unveraendert: {stats.vendors_skipped}\n\n"
+            f"_Mit /vendors siehst du was gelernt wurde._",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        db.log_action(None, "learn", actor=f"telegram:{update.effective_chat.id}", details={
+            "bills_processed": stats.bills_processed,
+            "vendors_created": stats.vendors_created,
+            "vendors_updated": stats.vendors_updated,
+        })
+    except RuntimeError as e:
+        # z.B. wenn /sync fehlt
+        await msg.edit_text(
+            f"⚠️ *Lernen nicht moeglich*\n\n{truncate(str(e), 200)}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception as e:
+        logger.exception(f"Lern-Fehler: {e}")
+        await msg.edit_text(
+            f"❌ *Fehler beim Lernen*\n\n`{truncate(str(e), 300)}`",
             parse_mode=ParseMode.MARKDOWN,
         )
 
@@ -849,6 +907,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("sync", cmd_sync))
+    app.add_handler(CommandHandler("learn", cmd_learn))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("vendors", cmd_vendors))
     

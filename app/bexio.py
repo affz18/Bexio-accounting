@@ -352,23 +352,89 @@ class BexioClient:
 
         try:
             result = await self._request("POST", "/4.0/purchase/bills", json=payload)
-            if result:
-                bill_id = result.get("id")
-                logger.info(f"Bexio Bill erstellt: #{bill_id} fuer Vendor {vendor_bexio_id}, {gross_amount} CHF")
-                return result
-            return None
         except BexioError as e:
             logger.error(f"Fehler beim Bill-Erstellen: {e.response_body or e}")
-            # Reraise damit Bot den User informieren kann
             raise
 
-    async def get_supplier_bill(self, bill_id: int) -> Optional[Dict[str, Any]]:
+        if not result:
+            return None
+
+        bill_id = result.get("id")
+        logger.info(f"Bexio Bill erstellt (DRAFT): #{bill_id} fuer Vendor {vendor_bexio_id}, {gross_amount} CHF")
+
+        # Bexio v4 erstellt die Bill als DRAFT - sie ist im UI sichtbar aber
+        # NICHT im Kontenblatt verbucht. Wir transitionen direkt auf BOOKED,
+        # damit die Buchung in der Buchhaltung landet.
+        if bill_id:
+            try:
+                await self._request("PUT", f"/4.0/purchase/bills/{bill_id}/bookings/BOOKED")
+                logger.info(f"Bexio Bill #{bill_id} auf BOOKED transitioned")
+            except BexioError as book_err:
+                logger.error(
+                    f"Bill #{bill_id} als DRAFT erstellt, aber Buchungs-Transition "
+                    f"fehlgeschlagen: {book_err.response_body or book_err}"
+                )
+                raise BexioError(
+                    f"Bill als DRAFT erstellt (ID {bill_id}), aber automatische Buchung "
+                    f"fehlgeschlagen. Bitte in Bexio manuell buchen oder loeschen. "
+                    f"Detail: {book_err}",
+                    status_code=book_err.status_code,
+                    response_body=book_err.response_body,
+                )
+
+        return result
+
+    async def get_supplier_bill(self, bill_id) -> Optional[Dict[str, Any]]:
         """Holt eine bestehende Bill zur Verifikation."""
         try:
             return await self._request("GET", f"/4.0/purchase/bills/{bill_id}")
         except BexioError as e:
             logger.error(f"Fehler beim Bill-Abruf {bill_id}: {e}")
             return None
+
+    async def list_supplier_bills_page(
+        self,
+        page: int = 1,
+        limit: int = 500,
+        bill_date_start: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Listet Supplier-Bills paginiert (v4).
+        Returns: {"data": [BillListItem...], "paging": {...}}
+        WICHTIG: list-items enthalten KEINE line_items / supplier_id - dafuer
+        get_supplier_bill(id) nutzen.
+        """
+        params: Dict[str, Any] = {
+            "limit": limit,
+            "page": page,
+            "order": "desc",
+            "sort": "bill_date",
+        }
+        if bill_date_start:
+            params["bill_date_start"] = bill_date_start
+        result = await self._request("GET", "/4.0/purchase/bills", params=params)
+        if isinstance(result, dict):
+            return result
+        if isinstance(result, list):
+            # Falls Bexio mal ohne Envelope antwortet
+            return {"data": result, "paging": {}}
+        return {"data": [], "paging": {}}
+
+    async def list_contacts_page(
+        self,
+        offset: int = 0,
+        limit: int = 2000,
+    ) -> List[Dict[str, Any]]:
+        """Listet Kontakte paginiert (v2, offset-basiert)."""
+        try:
+            result = await self._request(
+                "GET", "/2.0/contact",
+                params={"limit": limit, "offset": offset, "order_by": "id"},
+            )
+            return result if isinstance(result, list) else []
+        except BexioError as e:
+            logger.error(f"Fehler beim Contact-Listing offset={offset}: {e}")
+            return []
     
     # =========================================================
     # BANK-KONTEN (fuer Payment-Info)
