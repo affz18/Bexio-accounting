@@ -26,14 +26,36 @@ logger = setup_logger(__name__)
 SUPPORTED_MIME_PREFIXES = ("application/pdf", "image/")
 SUPPORTED_EXTENSIONS = (".pdf", ".jpg", ".jpeg", ".png", ".heic", ".heif")
 
+# Outlook/HTML-Mails baetten Signatur-Grafiken oder Tracking-Pixel als
+# inline Attachments ein. Die filtern wir per content_disposition raus -
+# echte Rechnungen kommen praktisch immer als 'attachment', nicht 'inline'.
+INLINE_DISPOSITIONS = ("inline",)
+MIN_ATTACHMENT_BYTES = 5 * 1024  # < 5 KB ist ziemlich sicher Pixel/Logo
+
 
 def _attachment_is_supported(att: MailAttachment) -> bool:
     """PDF / JPG / PNG / HEIC zaehlen. Sonstiges ignorieren."""
     mime = (att.content_type or "").lower()
     if any(mime.startswith(p) for p in SUPPORTED_MIME_PREFIXES):
-        return True
-    name = (att.filename or "").lower()
-    return name.endswith(SUPPORTED_EXTENSIONS)
+        pass
+    else:
+        name = (att.filename or "").lower()
+        if not name.endswith(SUPPORTED_EXTENSIONS):
+            return False
+
+    # Inline-Anhaenge sind typischerweise Outlook-Signatur-Grafiken oder
+    # Tracking-Pixel - keine Belege.
+    disposition = (att.content_disposition or "").lower()
+    if disposition in INLINE_DISPOSITIONS:
+        return False
+
+    # Mini-Bilder (Pixel/Icons) auch raus - PDFs sind sowieso > 5KB,
+    # echte Rechnungs-Scans auch.
+    size = att.size or (len(att.payload) if att.payload else 0)
+    if size < MIN_ATTACHMENT_BYTES:
+        return False
+
+    return True
 
 
 def _supported_attachments(msg: MailMessage) -> List[MailAttachment]:
