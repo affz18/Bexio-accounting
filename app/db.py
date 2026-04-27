@@ -744,3 +744,65 @@ def log_action(
         # Log-Fehler nicht propagieren, sonst crasht alles
         logger.error(f"Fehler beim Audit-Log: {e}")
         return False
+
+
+# =========================================================
+# IMAP PROCESSED EMAILS (Idempotenz fuer Inbox-Scan)
+# =========================================================
+
+def is_email_uid_processed(uid: str, folder: str = "INBOX", account: str = "") -> bool:
+    """True, wenn diese (account, folder, uid)-Kombi bereits verarbeitet wurde."""
+    try:
+        result = (
+            get_client()
+            .table("processed_emails")
+            .select("uid")
+            .eq("account", account)
+            .eq("folder", folder)
+            .eq("uid", uid)
+            .limit(1)
+            .execute()
+        )
+        return bool(result.data)
+    except Exception as e:
+        logger.error(f"Fehler beim UID-Check {uid}: {e}")
+        # Im Zweifel als unverarbeitet behandeln - lieber doppelt schicken
+        # als verlieren, der User kann dann reject klicken.
+        return False
+
+
+def mark_email_uid_processed(
+    uid: str,
+    folder: str,
+    account: str,
+    status: str,
+    invoice_id: Optional[str] = None,
+    subject: Optional[str] = None,
+    from_address: Optional[str] = None,
+    error: Optional[str] = None,
+) -> bool:
+    """
+    Markiert eine IMAP-Mail als verarbeitet.
+    status: 'filtered' | 'processed' | 'failed' | 'no_attachment'
+    """
+    try:
+        payload = {
+            "uid": uid,
+            "folder": folder,
+            "account": account,
+            "status": status,
+            "invoice_id": invoice_id,
+            "subject": subject,
+            "from_address": from_address,
+            "error": error,
+        }
+        (
+            get_client()
+            .table("processed_emails")
+            .upsert(payload, on_conflict="account,folder,uid")
+            .execute()
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Fehler beim UID-Mark {uid}: {e}")
+        return False

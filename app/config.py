@@ -4,7 +4,7 @@ Laedt alle ENV-Variablen typsicher und validiert sie beim Start.
 """
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
-from typing import List
+from typing import List, Optional
 
 
 class Settings(BaseSettings):
@@ -33,6 +33,23 @@ class Settings(BaseSettings):
     # App
     log_level: str = Field(default="INFO")
     environment: str = Field(default="development")
+
+    # IMAP (Hostpoint Inbox-Scan)
+    imap_enabled: bool = Field(default=False, description="IMAP-Polling aktivieren")
+    imap_host: str = Field(default="imap.mail.hostpoint.ch")
+    imap_port: int = Field(default=993)
+    imap_user: str = Field(default="", description="IMAP-Benutzer (Mail-Adresse)")
+    imap_password: str = Field(default="", description="IMAP-Passwort (App-spezifisch empfohlen)")
+    imap_folder: str = Field(default="INBOX")
+    imap_poll_interval_seconds: int = Field(default=60)
+    imap_keywords_regex: str = Field(
+        default=r"rechnung|invoice|quittung|beleg|gutschrift|kreditrechnung|bill|receipt|fattura|facture",
+        description="Case-insensitive Regex auf Subject+Body"
+    )
+    telegram_notify_chat_id: str = Field(
+        default="",
+        description="Chat-ID fuer IMAP-Benachrichtigungen. Leer = erste aus telegram_allowed_chat_ids"
+    )
     
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -55,6 +72,20 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.environment.lower() == "production"
+
+    @property
+    def imap_notify_chat_id(self) -> Optional[int]:
+        """
+        Chat-ID fuer IMAP-Benachrichtigungen.
+        Faellt auf erste allowed_chat_id zurueck wenn telegram_notify_chat_id leer.
+        """
+        if self.telegram_notify_chat_id.strip():
+            try:
+                return int(self.telegram_notify_chat_id.strip())
+            except ValueError:
+                return None
+        ids = self.allowed_chat_ids_list
+        return ids[0] if ids else None
 
 
 # Singleton: einmal laden, ueberall importieren

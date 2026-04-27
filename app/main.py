@@ -13,6 +13,7 @@ from app.config import settings
 from app.utils import setup_logger
 from app.bot import build_application
 from app.bexio import bexio as bexio_client
+from app.imap_inbox import run_imap_poller
 
 
 logger = setup_logger(__name__)
@@ -54,9 +55,15 @@ async def _main() -> None:
         allowed_updates=["message", "callback_query"],
         drop_pending_updates=True,  # alte Updates beim Restart ignorieren
     )
-    
+
+    # IMAP-Poller parallel starten (No-Op wenn IMAP_ENABLED=false)
+    imap_task = asyncio.create_task(
+        run_imap_poller(app, stop_event),
+        name="imap_poller",
+    )
+
     logger.info("✅ Bot laeuft. Warte auf Nachrichten…")
-    
+
     try:
         # Blockiere bis Shutdown-Signal
         await stop_event.wait()
@@ -68,6 +75,15 @@ async def _main() -> None:
             await app.shutdown()
         except Exception as e:
             logger.error(f"Fehler beim Bot-Shutdown: {e}")
+
+        # IMAP-Task sauber beenden
+        try:
+            await asyncio.wait_for(imap_task, timeout=10)
+        except asyncio.TimeoutError:
+            logger.warning("IMAP-Task hat Shutdown-Timeout - cancel")
+            imap_task.cancel()
+        except Exception as e:
+            logger.error(f"Fehler beim IMAP-Task-Shutdown: {e}")
         
         # Bexio-Client aufraeumen
         try:
