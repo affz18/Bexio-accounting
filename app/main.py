@@ -19,6 +19,57 @@ from app.imap_inbox import run_imap_poller
 logger = setup_logger(__name__)
 
 
+async def _shutdown(app, imap_task) -> None:
+    """
+    Faehrt Bot und alle Hintergrund-Tasks sauber herunter.
+
+    Wird sowohl im Normalfall (stop_event gesetzt) als auch bei
+    CancelledError (asyncio.run() bricht ab) aufgerufen.
+    asyncio.shield() schuetzt die Cleanup-Coroutinen davor, selbst
+    gecancelt zu werden, waehrend der Event-Loop herunterfaehrt.
+    """
+    logger.info("Stoppe Bot…")
+
+    # Updater zuerst stoppen - beendet das Telegram-Polling sofort,
+    # damit kein zweiter Bot-Prozess einen Konflikt ausloest.
+    try:
+        await asyncio.shield(app.updater.stop())
+    except Exception as e:
+        logger.error(f"Fehler beim Updater-Stop: {e}")
+
+    try:
+        await asyncio.shield(app.stop())
+    except Exception as e:
+        logger.error(f"Fehler beim App-Stop: {e}")
+
+    try:
+        await asyncio.shield(app.shutdown())
+    except Exception as e:
+        logger.error(f"Fehler beim App-Shutdown: {e}")
+
+    # IMAP-Task sauber beenden
+    if not imap_task.done():
+        try:
+            await asyncio.wait_for(asyncio.shield(imap_task), timeout=10)
+        except asyncio.TimeoutError:
+            logger.warning("IMAP-Task hat Shutdown-Timeout - cancel")
+            imap_task.cancel()
+            try:
+                await imap_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        except Exception as e:
+            logger.error(f"Fehler beim IMAP-Task-Shutdown: {e}")
+
+    # Bexio-Client aufraeumen
+    try:
+        await asyncio.shield(bexio_client.close())
+    except Exception as e:
+        logger.error(f"Fehler beim Bexio-Client-Shutdown: {e}")
+
+    logger.info("👋 Bot beendet.")
+
+
 async def _main() -> None:
     """Haupt-Loop: Bot starten, Shutdown sauber handhaben."""
     logger.info("=" * 60)
@@ -27,27 +78,27 @@ async def _main() -> None:
     logger.info(f"Gemini Model: {settings.gemini_model}")
     logger.info(f"Log Level: {settings.log_level}")
     logger.info("=" * 60)
-    
+
     # Telegram Application bauen
     app = build_application()
-    
+
     # Shutdown-Event fuer sauberes Beenden
     stop_event = asyncio.Event()
-    
-    def _signal_handler():
-        logger.info("Shutdown-Signal empfangen")
+
+    def _signal_handler(sig_name: str):
+        logger.info(f"Signal {sig_name} empfangen – leite Shutdown ein")
         stop_event.set()
-    
+
     loop = asyncio.get_running_loop()
     # SIGTERM kommt von Railway bei Deploys
     # SIGINT kommt bei Ctrl+C lokal
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
-            loop.add_signal_handler(sig, _signal_handler)
+            loop.add_signal_handler(sig, _signal_handler, sig.name)
         except NotImplementedError:
             # Windows unterstuetzt das nicht - egal, wir deployen auf Linux
             pass
-    
+
     # Bot starten
     await app.initialize()
     await app.start()
@@ -67,31 +118,12 @@ async def _main() -> None:
     try:
         # Blockiere bis Shutdown-Signal
         await stop_event.wait()
+    except asyncio.CancelledError:
+        # asyncio.run() hat den Task gecancelt (z.B. durch KeyboardInterrupt
+        # bevor der Signal-Handler greifen konnte) – trotzdem sauber beenden.
+        logger.info("Task gecancelt – starte Shutdown")
     finally:
-        logger.info("Stoppe Bot…")
-        try:
-            await app.updater.stop()
-            await app.stop()
-            await app.shutdown()
-        except Exception as e:
-            logger.error(f"Fehler beim Bot-Shutdown: {e}")
-
-        # IMAP-Task sauber beenden
-        try:
-            await asyncio.wait_for(imap_task, timeout=10)
-        except asyncio.TimeoutError:
-            logger.warning("IMAP-Task hat Shutdown-Timeout - cancel")
-            imap_task.cancel()
-        except Exception as e:
-            logger.error(f"Fehler beim IMAP-Task-Shutdown: {e}")
-        
-        # Bexio-Client aufraeumen
-        try:
-            await bexio_client.close()
-        except Exception as e:
-            logger.error(f"Fehler beim Bexio-Client-Shutdown: {e}")
-        
-        logger.info("👋 Bot beendet.")
+        await _shutdown(app, imap_task)
 
 
 def main() -> None:
@@ -99,7 +131,9 @@ def main() -> None:
     try:
         asyncio.run(_main())
     except KeyboardInterrupt:
-        logger.info("Interrupt durch User")
+        # asyncio.run() propagiert KeyboardInterrupt nach dem Task-Cancel.
+        # _shutdown() wurde bereits im finally-Block von _main() ausgefuehrt.
+        logger.info("Prozess durch KeyboardInterrupt beendet")
         sys.exit(0)
     except Exception as e:
         logger.exception(f"Fataler Fehler: {e}")
