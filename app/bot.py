@@ -324,75 +324,128 @@ async def _process_invoice_file(
     mime_type: str,
     file_size: Optional[int],
 ) -> None:
-    """Gemeinsamer Workflow fuer Document und Photo."""
+    """Telegram-Pfad: Datei aus Telegram holen, dann gemeinsamen Kern aufrufen."""
     chat_id = update.effective_chat.id
-    
-    # 1. Bestaetigung zeigen
+
     status_msg = await update.message.reply_text(
         f"📄 Beleg empfangen ({truncate(filename, 40)})\n"
         f"⏳ Lade herunter und analysiere…"
     )
-    
+
     try:
-        # 2. Datei von Telegram holen
         tg_file = await context.bot.get_file(file_id)
-        file_bytes = await tg_file.download_as_bytearray()
-        file_bytes = bytes(file_bytes)
-        
-        # 3. In Supabase Storage speichern
+        file_bytes = bytes(await tg_file.download_as_bytearray())
+    except Exception as e:
+        logger.exception(f"Telegram-Download fehlgeschlagen: {e}")
+        await status_msg.edit_text(f"❌ Download-Fehler: `{truncate(str(e), 150)}`",
+                                   parse_mode=ParseMode.MARKDOWN)
+        return
+
+    await process_invoice_bytes(
+        bot=context.bot,
+        notify_chat_id=chat_id,
+        file_bytes=file_bytes,
+        filename=filename,
+        mime_type=mime_type,
+        file_size=file_size,
+        source="telegram",
+        source_reference=str(update.message.message_id),
+        actor=f"telegram:{chat_id}",
+        status_msg=status_msg,
+    )
+
+
+async def process_invoice_bytes(
+    *,
+    bot,
+    notify_chat_id: int,
+    file_bytes: bytes,
+    filename: str,
+    mime_type: str,
+    file_size: Optional[int],
+    source: str,
+    source_reference: Optional[str],
+    actor: str,
+    status_msg=None,
+) -> Optional[str]:
+    """
+    Source-agnostischer Pipeline-Kern.
+
+    Wird sowohl von Telegram-Handlers als auch vom IMAP-Connector aufgerufen.
+    Wenn status_msg gegeben ist, wird die existierende Nachricht editiert
+    (Telegram-Pfad). Sonst wird eine neue Nachricht in notify_chat_id gepostet
+    (IMAP-Pfad).
+
+    Returns: invoice_id bei Erfolg (oder bei "not_invoice"), sonst None.
+    """
+
+    async def _say(text: str, **kwargs):
+        """Schickt Status entweder als Edit oder als neue Message."""
+        if status_msg is not None:
+            await status_msg.edit_text(text, **kwargs)
+            return status_msg
+        return await bot.send_message(chat_id=notify_chat_id, text=text, **kwargs)
+
+    current_msg = status_msg
+
+    try:
         storage_path = storage.upload_invoice_file(
             file_bytes=file_bytes,
             original_filename=filename,
             mime_type=mime_type,
         )
         if not storage_path:
-            await status_msg.edit_text("❌ Fehler beim Speichern der Datei.")
-            return
-        
-        # 4. Pending-Invoice Eintrag
+            await _say("❌ Fehler beim Speichern der Datei.")
+            return None
+
         invoice_id = db.create_pending_invoice(
-            source="telegram",
-            source_reference=str(update.message.message_id),
+            source=source,
+            source_reference=source_reference,
             file_path=storage_path,
             original_filename=filename,
             file_size_bytes=file_size,
             file_mime_type=mime_type,
         )
         if not invoice_id:
-            await status_msg.edit_text("❌ Fehler beim DB-Eintrag.")
-            return
-        
-        db.log_action(invoice_id, "received", actor=f"telegram:{chat_id}", details={
+            await _say("❌ Fehler beim DB-Eintrag.")
+            return None
+
+        db.log_action(invoice_id, "received", actor=actor, details={
             "filename": filename,
             "mime_type": mime_type,
             "size": file_size,
+            "source": source,
         })
-        
-        # 5. Gemini-Extraktion
-        await status_msg.edit_text("🧠 Gemini analysiert das Dokument…")
-        
+
+        current_msg = await _say(
+            f"📄 Beleg empfangen ({truncate(filename, 40)})\n"
+            f"🧠 Gemini analysiert das Dokument…"
+        )
+
         try:
             result = await gemini.extract_invoice(file_bytes, mime_type)
         except gemini.GeminiOverloadedError as e:
             db.mark_invoice_failed(invoice_id, f"Gemini ueberlastet: {e}")
-            db.log_action(invoice_id, "extraction_failed", details={"error": str(e), "reason": "overloaded"})
-            await status_msg.edit_text(
-                "⏳ *Gemini ist gerade ueberlastet*\n\n"
-                "Die Google-Server haben hohe Auslastung. "
-                "Bitte schick die Rechnung in 2-3 Minuten nochmal.",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-            return
+            db.log_action(invoice_id, "extraction_failed",
+                          details={"error": str(e), "reason": "overloaded"})
+            if current_msg:
+                await current_msg.edit_text(
+                    "⏳ *Gemini ist gerade ueberlastet*\n\n"
+                    "Die Google-Server haben hohe Auslastung. "
+                    "Bitte spaeter erneut versuchen.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            return None
         except gemini.GeminiError as e:
             db.mark_invoice_failed(invoice_id, f"Gemini-Fehler: {e}")
             db.log_action(invoice_id, "extraction_failed", details={"error": str(e)})
-            await status_msg.edit_text(
-                f"❌ *Extraktion fehlgeschlagen*\n\n`{truncate(str(e), 200)}`",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-            return
-        
-        # 6. Ist es eine Rechnung?
+            if current_msg:
+                await current_msg.edit_text(
+                    f"❌ *Extraktion fehlgeschlagen*\n\n`{truncate(str(e), 200)}`",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            return None
+
         if not result.is_invoice:
             db.update_invoice_extraction(
                 invoice_id=invoice_id,
@@ -400,13 +453,13 @@ async def _process_invoice_file(
                 status="not_invoice",
             )
             db.log_action(invoice_id, "not_invoice")
-            await status_msg.edit_text(
-                "🤔 Das sieht nicht nach einer Rechnung aus.\n"
-                "Ich ignoriere das Dokument."
-            )
-            return
-        
-        # 7. Extrahierte Daten speichern
+            if current_msg:
+                await current_msg.edit_text(
+                    "🤔 Das sieht nicht nach einer Rechnung aus.\n"
+                    "Ich ignoriere das Dokument."
+                )
+            return invoice_id
+
         db.update_invoice_extraction(
             invoice_id=invoice_id,
             extracted_data=result.model_dump(),
@@ -422,20 +475,31 @@ async def _process_invoice_file(
             status="extracted",
         )
         db.log_action(invoice_id, "extracted", details=result.model_dump())
-        
-        # 8. Vendor-Matching + Vorschlag bauen
+
         await _show_suggestion(
-            status_msg=status_msg,
+            status_msg=current_msg,
             invoice_id=invoice_id,
             result=result,
         )
-    
+        return invoice_id
+
     except Exception as e:
         logger.exception(f"Unerwarteter Fehler beim Datei-Processing: {e}")
-        await status_msg.edit_text(
-            f"❌ *Unerwarteter Fehler*\n\n`{truncate(str(e), 200)}`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        try:
+            if current_msg:
+                await current_msg.edit_text(
+                    f"❌ *Unerwarteter Fehler*\n\n`{truncate(str(e), 200)}`",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            else:
+                await bot.send_message(
+                    chat_id=notify_chat_id,
+                    text=f"❌ *Unerwarteter Fehler*\n\n`{truncate(str(e), 200)}`",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+        except Exception:
+            pass
+        return None
 
 
 # =========================================================
