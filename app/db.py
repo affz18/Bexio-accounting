@@ -468,25 +468,34 @@ def sync_taxes(taxes: List[Dict[str, Any]]) -> int:
 
 
 def get_input_tax_codes() -> List[Dict[str, Any]]:
-    """Vorsteuer-Codes (Eingangsrechnungen) holen."""
+    """
+    Vorsteuer-Codes (Eingangsrechnungen) holen.
+    Bexio unterscheidet pre_tax (Vorsteuer, Kreditoren) und sales_tax
+    (Umsatzsteuer, Debitoren). Fuer Eingangsrechnungen brauchen wir nur
+    pre_tax - sonst wirft Bexio purchase.validation.tax_incorrect.
+    """
     try:
         result = (
             get_client()
             .table("tax_mappings")
             .select("*")
             .eq("is_active", True)
+            .eq("tax_type", "pre_tax")
             .order("tax_rate", desc=True)
             .execute()
         )
-        # Tax-Type kann "pre_tax" oder "sales_tax" sein, je nach Bexio-Version
         return result.data or []
     except Exception as e:
         logger.error(f"Fehler beim Laden Tax-Codes: {e}")
         return []
 
 
-def find_tax_by_rate(rate: float) -> Optional[Dict[str, Any]]:
-    """Findet den MwSt-Code fuer einen bestimmten Satz (z.B. 8.1)."""
+def find_tax_by_rate(rate: float, tax_type: str = "pre_tax") -> Optional[Dict[str, Any]]:
+    """
+    Findet den MwSt-Code fuer einen bestimmten Satz (z.B. 8.1).
+    Bexio hat pro Satz zwei IDs (pre_tax fuer Eingang, sales_tax fuer Ausgang).
+    Default pre_tax weil unser Hauptpfad Kreditorenbuchungen sind.
+    """
     try:
         # Toleranz von 0.1% fuer Rundungsfehler
         result = (
@@ -496,6 +505,7 @@ def find_tax_by_rate(rate: float) -> Optional[Dict[str, Any]]:
             .gte("tax_rate", rate - 0.05)
             .lte("tax_rate", rate + 0.05)
             .eq("is_active", True)
+            .eq("tax_type", tax_type)
             .limit(1)
             .execute()
         )
