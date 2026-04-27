@@ -180,35 +180,58 @@ def _get_client() -> genai.Client:
 # HAUPT-EXTRAKTION
 # =========================================================
 
+# Hard-Timeout fuer den gesamten Gemini-Extraction-Pfad inkl. Retries.
+# Ohne diesen Wert kann ein gestallter HTTP-Call den Worker-Thread blockieren,
+# weil das genai-SDK kein default-Timeout gesetzt hat. 600s ist bewusst
+# grosszuegig - der Free-Tier kann bei grossen PDFs deutlich >5min brauchen,
+# aber alles >10min ist klar pathologisch und sollte abgebrochen werden.
+EXTRACT_TIMEOUT_SECONDS = 600.0
+
+
 async def extract_invoice(
     file_bytes: bytes,
     mime_type: str = "application/pdf",
 ) -> InvoiceExtractionResult:
     """
     Extrahiert Rechnungsdaten aus einem PDF oder Bild via Gemini.
-    
+
     Args:
         file_bytes: Die Datei als bytes
         mime_type: MIME-Typ (application/pdf, image/jpeg, image/png, image/heic)
-    
+
     Returns:
         InvoiceExtractionResult mit den extrahierten Daten.
-    
+
     Raises:
-        GeminiError: Bei API-Fehlern oder ungueltiger Response.
+        GeminiError: Bei API-Fehlern, Timeout oder ungueltiger Response.
     """
     if not file_bytes:
         raise GeminiError("Leere Datei erhalten")
-    
+
+    logger.info(
+        f"Gemini-Call startet (mime={mime_type}, size={len(file_bytes)} bytes, "
+        f"timeout={EXTRACT_TIMEOUT_SECONDS:.0f}s)"
+    )
     try:
         # Gemini's Python SDK ist synchron, wir wrappen in asyncio.to_thread
-        # damit der Event-Loop nicht blockiert
-        result = await asyncio.to_thread(
-            _extract_sync,
-            file_bytes,
-            mime_type,
+        # damit der Event-Loop nicht blockiert. asyncio.wait_for sorgt dafuer,
+        # dass der Caller bei einem stallenden Call nicht ewig haengt - der
+        # Worker-Thread laeuft dann zwar weiter (to_thread ist nicht
+        # cancellable), aber die Pipeline kann sauber failen.
+        result = await asyncio.wait_for(
+            asyncio.to_thread(_extract_sync, file_bytes, mime_type),
+            timeout=EXTRACT_TIMEOUT_SECONDS,
         )
         return result
+    except asyncio.TimeoutError:
+        logger.error(
+            f"Gemini-Call Timeout nach {EXTRACT_TIMEOUT_SECONDS:.0f}s "
+            f"(mime={mime_type}, size={len(file_bytes)} bytes)"
+        )
+        raise GeminiError(
+            f"Gemini hat nicht innerhalb von {EXTRACT_TIMEOUT_SECONDS:.0f}s "
+            f"geantwortet."
+        )
     except GeminiError:
         raise  # bereits sauber, weitergeben
     except Exception as e:
