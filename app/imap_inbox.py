@@ -30,27 +30,41 @@ SUPPORTED_EXTENSIONS = (".pdf", ".jpg", ".jpeg", ".png", ".heic", ".heif")
 # inline Attachments ein. Die filtern wir per content_disposition raus -
 # echte Rechnungen kommen praktisch immer als 'attachment', nicht 'inline'.
 INLINE_DISPOSITIONS = ("inline",)
-MIN_ATTACHMENT_BYTES = 5 * 1024  # < 5 KB ist ziemlich sicher Pixel/Logo
+
+# Outlook nummeriert eingebettete Signatur-Bilder durch.
+# image001.jpg, image002.png etc. sind quasi nie echte Belege.
+OUTLOOK_INLINE_NAME_RE = re.compile(r"^image\d{3,4}\.(jpe?g|png|gif|bmp)$", re.IGNORECASE)
+
+# < 20 KB ist mit hoher Wahrscheinlichkeit Logo/Pixel/Icon.
+# Echte Rechnungs-Scans (selbst stark komprimiert) sind > 50 KB.
+MIN_ATTACHMENT_BYTES = 20 * 1024
 
 
 def _attachment_is_supported(att: MailAttachment) -> bool:
-    """PDF / JPG / PNG / HEIC zaehlen. Sonstiges ignorieren."""
+    """PDF / JPG / PNG / HEIC zaehlen. Sonstiges + Inline-Grafiken ignorieren."""
     mime = (att.content_type or "").lower()
-    if any(mime.startswith(p) for p in SUPPORTED_MIME_PREFIXES):
-        pass
-    else:
-        name = (att.filename or "").lower()
-        if not name.endswith(SUPPORTED_EXTENSIONS):
-            return False
+    name = (att.filename or "").lower()
 
-    # Inline-Anhaenge sind typischerweise Outlook-Signatur-Grafiken oder
-    # Tracking-Pixel - keine Belege.
+    mime_ok = any(mime.startswith(p) for p in SUPPORTED_MIME_PREFIXES)
+    ext_ok = name.endswith(SUPPORTED_EXTENSIONS)
+    if not (mime_ok or ext_ok):
+        return False
+
+    # Inline-Anhaenge: Outlook-Signatur-Grafiken oder Tracking-Pixel
     disposition = (att.content_disposition or "").lower()
     if disposition in INLINE_DISPOSITIONS:
         return False
 
-    # Mini-Bilder (Pixel/Icons) auch raus - PDFs sind sowieso > 5KB,
-    # echte Rechnungs-Scans auch.
+    # Outlook-Standard-Filename fuer eingebettete Bilder
+    if OUTLOOK_INLINE_NAME_RE.match(name):
+        return False
+
+    # MIME-CID gesetzt = Bild ist im HTML-Body eingebettet (Logo/Signatur)
+    # PDFs haben praktisch nie eine content_id.
+    if att.content_id and mime.startswith("image/"):
+        return False
+
+    # Mini-Dateien (Pixel/Icons) raus
     size = att.size or (len(att.payload) if att.payload else 0)
     if size < MIN_ATTACHMENT_BYTES:
         return False
