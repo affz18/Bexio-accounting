@@ -481,6 +481,10 @@ async def _show_suggestion(
             InlineKeyboardButton("📝 Anderes Konto", callback_data=f"change:{invoice_id}"),
         ],
         [
+            InlineKeyboardButton(
+                "🧾 Privat bezahlt",
+                callback_data=f"bookpriv:{invoice_id}",
+            ),
             InlineKeyboardButton("❌ Verwerfen", callback_data=f"reject:{invoice_id}"),
         ],
     ]
@@ -506,7 +510,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     
     data = query.data or ""
     
-    if data.startswith("book:"):
+    if data.startswith("bookpriv:"):
+        invoice_id = data.split(":", 1)[1]
+        await _callback_book_private(query, invoice_id)
+    elif data.startswith("book:"):
         invoice_id = data.split(":", 1)[1]
         await _callback_book(query, invoice_id)
     elif data.startswith("change:"):
@@ -569,6 +576,118 @@ async def _callback_book(query, invoice_id: str) -> None:
         db.log_action(invoice_id, "booking_failed", details={"error": str(e)})
         await query.edit_message_text(
             f"❌ *Bexio-Fehler*\n\n`{truncate(str(e), 300)}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+
+async def _callback_book_private(query, invoice_id: str) -> None:
+    """
+    User klickt auf 'Privat bezahlt'. Buchung als direkter Manual-Journal-
+    Entry: Aufwand an Kontokorrent Inhaber (z.B. 2100). Keine Lieferanten-
+    Rechnung wird erstellt - es gibt keine offene Verbindlichkeit gegen
+    einen Dritten, weil der Inhaber selber gezahlt hat.
+    """
+    invoice = db.get_invoice(invoice_id)
+    if not invoice:
+        await query.edit_message_text("❌ Beleg nicht gefunden.")
+        return
+
+    if invoice.get("status") in ("booked", "booked_private"):
+        await query.edit_message_text("ℹ️ Schon gebucht.")
+        return
+
+    # Soll-Konto: das vorgeschlagene Aufwand-Konto
+    debit_account_id = invoice.get("suggested_account_id")
+    if not debit_account_id:
+        await query.edit_message_text(
+            "❌ *Kein Aufwand-Konto vorgeschlagen.*\n\n"
+            "Klicke erst `📝 Anderes Konto` und waehle ein Konto, "
+            "dann nochmal `🧾 Privat bezahlt`.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    # Haben-Konto: Kontokorrent Inhaber - aus Settings via Konto-Nr
+    credit_account_nr = settings.bexio_private_payment_credit_account_nr
+    credit_account = db.get_account_by_nr(credit_account_nr)
+    if not credit_account or not credit_account.get("bexio_account_id"):
+        await query.edit_message_text(
+            f"❌ *Konto {credit_account_nr} nicht im Cache.*\n\n"
+            f"Fuehre `/sync` aus damit der Bot den Kontenplan kennt. "
+            f"Falls Konto {credit_account_nr} in Bexio nicht existiert, "
+            f"setze `BEXIO_PRIVATE_PAYMENT_CREDIT_ACCOUNT_NR` auf eure "
+            f"Kontokorrent-Inhaber-Konto-Nr.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    credit_account_id = credit_account["bexio_account_id"]
+
+    total = invoice.get("total_amount")
+    if total is None:
+        await query.edit_message_text("❌ Betrag fehlt.")
+        return
+
+    # Buchungsdatum: Belegdatum, sonst heute
+    today_iso = datetime.now(timezone.utc).date().isoformat()
+    booking_date = invoice.get("invoice_date") or today_iso
+
+    vendor = invoice.get("vendor_name") or "Unbekannt"
+    description = (
+        f"Beleg {truncate(vendor, 40)} {booking_date} - "
+        f"privat durch Inhaber bezahlt"
+    )
+
+    await query.edit_message_text(
+        "⏳ Buche als 'privat bezahlt' in Bexio…",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    try:
+        result = await bexio_module.bexio.create_manual_journal_entry(
+            date=booking_date,
+            debit_account_id=int(debit_account_id),
+            credit_account_id=int(credit_account_id),
+            amount=float(total),
+            description=description,
+            tax_id=invoice.get("suggested_tax_id"),
+            reference_nr=invoice.get("invoice_number"),
+        )
+        if not result:
+            await query.edit_message_text(
+                "❌ Buchung fehlgeschlagen (siehe Logs)."
+            )
+            return
+
+        manual_entry_id = result.get("id") or "?"
+        db.mark_invoice_booked_private(invoice_id, str(manual_entry_id))
+        db.log_action(
+            invoice_id,
+            "booked_private",
+            actor=f"telegram:{query.from_user.id}",
+            details={
+                "bexio_manual_entry_id": str(manual_entry_id),
+                "debit_account_id": int(debit_account_id),
+                "credit_account_id": int(credit_account_id),
+                "credit_account_nr": credit_account_nr,
+                "amount": float(total),
+            },
+        )
+
+        await query.edit_message_text(
+            f"✅ *Privat bezahlt - Buchung erfasst*\n\n"
+            f"Manual Entry #{manual_entry_id}\n"
+            f"{vendor}\n"
+            f"{format_chf(total)}\n\n"
+            f"_Soll: Konto {invoice.get('suggested_account_nr') or '?'} · "
+            f"Haben: {credit_account_nr} {credit_account.get('account_name') or ''}_",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except bexio_module.BexioError as e:
+        db.mark_invoice_failed(invoice_id, str(e))
+        db.log_action(invoice_id, "booking_private_failed", details={"error": str(e)})
+        await query.edit_message_text(
+            f"❌ *Bexio-Fehler bei Privat-Buchung*\n\n"
+            f"`{truncate(str(e), 300)}`",
             parse_mode=ParseMode.MARKDOWN,
         )
 

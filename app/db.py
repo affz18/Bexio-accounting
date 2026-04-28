@@ -321,6 +321,29 @@ def get_all_accounts() -> List[Dict[str, Any]]:
         return []
 
 
+def get_account_by_nr(account_nr: str) -> Optional[Dict[str, Any]]:
+    """
+    Loest eine Konto-Nummer (z.B. '2100') in das gecachte Account-Dict auf.
+    Wird gebraucht um z.B. das Privatkonto-Konto-NR aus den Settings in eine
+    Bexio-account-id aufzuloesen.
+    """
+    if not account_nr:
+        return None
+    try:
+        result = (
+            get_client()
+            .table("account_mappings")
+            .select("*")
+            .eq("account_nr", str(account_nr))
+            .limit(1)
+            .execute()
+        )
+        return result.data[0] if result.data else None
+    except Exception as e:
+        logger.error(f"Fehler beim Account-Nr-Lookup '{account_nr}': {e}")
+        return None
+
+
 # =========================================================
 # TAX MAPPINGS (MwSt-Codes Cache)
 # =========================================================
@@ -532,6 +555,34 @@ def mark_invoice_booked(
         return True
     except Exception as e:
         logger.error(f"Fehler beim Markieren als gebucht: {e}")
+        return False
+
+
+def mark_invoice_booked_private(
+    invoice_id: str,
+    bexio_manual_entry_id: str,
+) -> bool:
+    """
+    Markiert Invoice als 'privat bezahlt' verbucht. Es wurde KEINE Bill in
+    Bexio erstellt, sondern ein Manual-Journal-Entry direkt auf das
+    Kontokorrent-Inhaber-Konto. Damit ist der Beleg buchhalterisch erledigt
+    und faellt NICHT in den Bank-Reconciliation-Pool.
+    """
+    try:
+        (
+            get_client()
+            .table("pending_invoices")
+            .update({
+                "status": "booked_private",
+                "bexio_bill_id": str(bexio_manual_entry_id),
+                "bexio_booked_at": datetime.now(timezone.utc).isoformat(),
+            })
+            .eq("id", invoice_id)
+            .execute()
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Fehler beim Markieren als 'privat bezahlt': {e}")
         return False
 
 

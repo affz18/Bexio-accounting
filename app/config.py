@@ -20,6 +20,14 @@ class Settings(BaseSettings):
     # Bexio
     bexio_api_token: str = Field(..., description="Bexio Personal Access Token")
     bexio_api_base_url: str = Field(default="https://api.bexio.com")
+    bexio_private_payment_credit_account_nr: str = Field(
+        default="2100",
+        description=(
+            "Konto-Nummer (NICHT Bexio-ID) auf welches eine 'privat bezahlt'-"
+            "Buchung als Haben-Seite gebucht wird. Klassisch 'Kontokorrent "
+            "Inhaber A' = 2100. Der Bot loest das in die Bexio-Account-ID auf."
+        ),
+    )
     
     # Supabase
     supabase_url: str = Field(..., description="Supabase Project URL")

@@ -155,9 +155,87 @@ class BexioClient:
         return result if isinstance(result, list) else []
     
     # =========================================================
+    # MANUAL JOURNAL ENTRIES (Buchungssaetze ohne Bill)
+    # =========================================================
+
+    async def create_manual_journal_entry(
+        self,
+        date: str,
+        debit_account_id: int,
+        credit_account_id: int,
+        amount: float,
+        description: str,
+        tax_id: Optional[int] = None,
+        reference_nr: Optional[str] = None,
+        currency_id: int = 1,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Schreibt einen einzelnen Buchungssatz direkt in die Bexio-Buchhaltung
+        ohne Umweg ueber Lieferantenrechnung.
+
+        Use-Case: Wenn der Inhaber eine Geschaeftsausgabe privat zahlt, ist
+        die korrekte Buchung 'Aufwand an Kontokorrent Inhaber'. Eine
+        Lieferantenrechnung waere unsauber, weil's keinen offenen Posten
+        gegen den Lieferanten gibt - wir schulden niemandem etwas (ausser
+        uns selber).
+
+        Args:
+            date: Buchungsdatum YYYY-MM-DD (typischerweise Belegdatum)
+            debit_account_id: Soll-Konto (Aufwand-Konto, z.B. 6500 ID)
+            credit_account_id: Haben-Konto (z.B. 2100 Kontokorrent Inhaber)
+            amount: Brutto-Betrag (mit MwSt). Bexio splittet via tax_id.
+            description: Buchungstext, z.B. 'Beleg Migros 28.04.2026 - privat'
+            tax_id: Bexio-Tax-ID fuer Vorsteuer-Split (optional). Wenn gesetzt,
+                rechnet Bexio MwSt automatisch aus dem Brutto-Betrag.
+            reference_nr: Externe Belegnummer (Rechnungs-Nr), optional
+            currency_id: Bexio-internes Currency-ID. Default 1 = CHF.
+
+        Returns: Bexio-Response-Dict mit der Manual-Entry-ID, oder None
+                 wenn API-Fehler.
+        """
+        entry: Dict[str, Any] = {
+            "debit_account_id": int(debit_account_id),
+            "credit_account_id": int(credit_account_id),
+            "amount": round(float(amount), 2),
+            "currency_id": int(currency_id),
+            "currency_factor": 1,
+            "description": description[:200],
+        }
+        if tax_id is not None:
+            entry["tax_id"] = int(tax_id)
+
+        payload: Dict[str, Any] = {
+            "type": "manual_single_entry",
+            "date": date,
+            "entries": [entry],
+        }
+        if reference_nr:
+            payload["reference_nr"] = str(reference_nr)[:50]
+
+        try:
+            result = await self._request(
+                "POST",
+                "/3.0/accounting/manual_entries",
+                json=payload,
+            )
+            entry_id = (result or {}).get("id") if isinstance(result, dict) else None
+            logger.info(
+                f"Bexio Manual-Journal-Entry erstellt: id={entry_id} "
+                f"Soll={debit_account_id} Haben={credit_account_id} "
+                f"Betrag={amount:.2f} Datum={date}"
+            )
+            return result if isinstance(result, dict) else None
+        except BexioError as e:
+            logger.error(
+                f"Bexio Manual-Entry fehlgeschlagen: Soll={debit_account_id} "
+                f"Haben={credit_account_id} Betrag={amount:.2f} - {e}"
+            )
+            raise
+
+    # =========================================================
     # MWST-CODES
     # =========================================================
-    
+
     async def list_taxes(self) -> List[Dict[str, Any]]:
         """
         Holt alle MwSt-Codes.
