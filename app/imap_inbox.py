@@ -26,6 +26,31 @@ logger = setup_logger(__name__)
 SUPPORTED_MIME_PREFIXES = ("application/pdf", "image/")
 SUPPORTED_EXTENSIONS = (".pdf", ".jpg", ".jpeg", ".png", ".heic", ".heif")
 
+# Outlook benennt eingebettete Inline-Bilder (Signaturen, HTML-Banner) als
+# image001.jpg, image002.png etc. Echte Foto-Anhaenge heissen anders.
+INLINE_IMAGE_NAME_RE = re.compile(r"^image\d{3,4}\.(jpe?g|png|gif|bmp)$", re.IGNORECASE)
+# Echte Beleg-Fotos sind quasi nie unter 20 KB.
+INLINE_IMAGE_MIN_SIZE_BYTES = 20 * 1024
+
+
+def _is_likely_inline_image(att: MailAttachment) -> bool:
+    """
+    Heuristik fuer Outlook-Inline-Bilder (Signaturen, eingebettete Banner):
+    Wenn mind. 2 der 3 Signale stimmen, behandeln wir das Bild als Inline.
+    PDFs werden hier nie gefiltert.
+    """
+    mime = (att.content_type or "").lower()
+    if not mime.startswith("image/"):
+        return False
+
+    has_cid = bool(getattr(att, "content_id", None))
+    name = (att.filename or "").strip().lower()
+    name_matches = bool(INLINE_IMAGE_NAME_RE.match(name))
+    size = len(att.payload) if att.payload else 0
+    is_tiny = 0 < size < INLINE_IMAGE_MIN_SIZE_BYTES
+
+    return sum([has_cid, name_matches, is_tiny]) >= 2
+
 
 def _attachment_is_supported(att: MailAttachment) -> bool:
     """PDF / JPG / PNG / HEIC zaehlen. Sonstiges ignorieren."""
@@ -37,7 +62,19 @@ def _attachment_is_supported(att: MailAttachment) -> bool:
 
 
 def _supported_attachments(msg: MailMessage) -> List[MailAttachment]:
-    return [a for a in msg.attachments if _attachment_is_supported(a)]
+    result: List[MailAttachment] = []
+    for a in msg.attachments:
+        if not _attachment_is_supported(a):
+            continue
+        if _is_likely_inline_image(a):
+            logger.debug(
+                f"Inline-Bild ignoriert: name={a.filename!r} "
+                f"size={len(a.payload) if a.payload else 0} "
+                f"cid={getattr(a, 'content_id', None)!r}"
+            )
+            continue
+        result.append(a)
+    return result
 
 
 def _matches_keywords(msg: MailMessage, pattern: re.Pattern) -> bool:
