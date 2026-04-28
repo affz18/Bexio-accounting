@@ -806,3 +806,155 @@ def mark_email_uid_processed(
     except Exception as e:
         logger.error(f"Fehler beim UID-Mark {uid}: {e}")
         return False
+
+
+# =========================================================
+# BANK-RECONCILIATION (Phase 4)
+# =========================================================
+
+def get_open_invoices_for_matching(
+    tenant_id: str = "visioskin",
+    limit: int = 500,
+) -> List[Dict[str, Any]]:
+    """
+    Liefert Pending-Invoices die als noch nicht bezahlt gelten und damit
+    Match-Kandidaten fuer Bank-Bewegungen sind. Status 'booked' (in Bexio
+    gebucht aber noch nicht abgeglichen) und 'extracted'/'awaiting_approval'
+    sind alle relevant - selbst wenn noch nicht in Bexio gebucht, kann der
+    User aus dem Match-Vorschlag implizit buchen lassen.
+    """
+    try:
+        result = (
+            get_client()
+            .table("pending_invoices")
+            .select("id, vendor_name, total_amount, iban, reference_number, "
+                    "invoice_date, due_date, status, bexio_bill_id")
+            .in_("status", ["extracted", "awaiting_approval", "booked"])
+            .order("invoice_date", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return result.data or []
+    except Exception as e:
+        logger.error(f"Fehler beim Laden offener Invoices: {e}")
+        return []
+
+
+def upsert_bank_transaction(tx_payload: Dict[str, Any]) -> Optional[str]:
+    """
+    Speichert eine Bank-Transaktion. Bei Konflikt auf
+    (tenant_id, bank_account_iban, transaction_id) wird nicht ueberschrieben -
+    die TX wurde schon importiert.
+
+    Returns: bank_transactions.id (uuid) bei Insert, oder die bestehende ID
+             bei Konflikt, oder None bei Fehler.
+    """
+    try:
+        result = (
+            get_client()
+            .table("bank_transactions")
+            .upsert(
+                tx_payload,
+                on_conflict="tenant_id,bank_account_iban,transaction_id",
+                ignore_duplicates=False,
+            )
+            .execute()
+        )
+        if result.data:
+            return result.data[0].get("id")
+        return None
+    except Exception as e:
+        logger.error(f"Fehler beim Bank-TX-Upsert: {e}")
+        return None
+
+
+def insert_payment_match(match_payload: Dict[str, Any]) -> Optional[str]:
+    """Speichert einen MatchCandidate als payment_matches-Zeile."""
+    try:
+        result = (
+            get_client()
+            .table("payment_matches")
+            .insert(match_payload)
+            .execute()
+        )
+        if result.data:
+            return result.data[0].get("id")
+        return None
+    except Exception as e:
+        logger.error(f"Fehler beim Payment-Match-Insert: {e}")
+        return None
+
+
+def get_pending_match_proposals(
+    tenant_id: str = "visioskin",
+    limit: int = 100,
+) -> List[Dict[str, Any]]:
+    """Liefert alle vom System vorgeschlagenen, noch nicht bestaetigten Matches."""
+    try:
+        result = (
+            get_client()
+            .table("payment_matches")
+            .select("*")
+            .eq("tenant_id", tenant_id)
+            .eq("status", "proposed")
+            .order("confidence", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return result.data or []
+    except Exception as e:
+        logger.error(f"Fehler beim Laden Match-Proposals: {e}")
+        return []
+
+
+def update_payment_match_status(
+    match_id: str,
+    status: str,
+    bexio_payment_id: Optional[str] = None,
+    error_message: Optional[str] = None,
+) -> bool:
+    """Updated den Status eines Payment-Match (confirmed/booked/rejected/failed)."""
+    payload: Dict[str, Any] = {"status": status}
+    now_iso = datetime.now(timezone.utc).isoformat()
+    if status == "confirmed":
+        payload["confirmed_at"] = now_iso
+    elif status == "booked":
+        payload["booked_at"] = now_iso
+        if bexio_payment_id:
+            payload["bexio_payment_id"] = bexio_payment_id
+    if error_message:
+        payload["error_message"] = error_message[:500]
+    try:
+        (
+            get_client()
+            .table("payment_matches")
+            .update(payload)
+            .eq("id", match_id)
+            .execute()
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Fehler beim Payment-Match-Update {match_id}: {e}")
+        return False
+
+
+def update_bank_transaction_match_status(
+    bank_transaction_id: str,
+    match_status: str,
+) -> bool:
+    """Updated den match_status einer Bank-Transaktion."""
+    try:
+        payload: Dict[str, Any] = {"match_status": match_status}
+        if match_status == "matched":
+            payload["matched_at"] = datetime.now(timezone.utc).isoformat()
+        (
+            get_client()
+            .table("bank_transactions")
+            .update(payload)
+            .eq("id", bank_transaction_id)
+            .execute()
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Fehler beim Bank-TX-Status-Update {bank_transaction_id}: {e}")
+        return False

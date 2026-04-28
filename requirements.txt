@@ -22,3 +22,7 @@ structlog>=24.4.0
 
 # IMAP Inbox-Scan (Hostpoint)
 imap-tools>=1.7.0
+
+# camt.054 Bank-Datei-Parser (Phase 4 - Bank-Reconciliation).
+# defusedxml schuetzt vor XXE/Billion-Laughs in untrusted XML.
+defusedxml>=0.7.1
