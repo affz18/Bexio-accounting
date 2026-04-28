@@ -117,3 +117,50 @@ class VendorMemory(BaseModel):
     confidence_score: float = 0.0
     iban: Optional[str] = None
     uid_nummer: Optional[str] = None
+
+
+# =========================================================
+# BANK-RECONCILIATION (Phase 4)
+# =========================================================
+
+class BankTransaction(BaseModel):
+    """
+    Eine Bank-Bewegung aus einer camt.054-Datei.
+
+    Vorzeichen-Konvention: amount ist immer signed (DBIT negativ, CRDT positiv).
+    Fuer Lieferanten-Zahlungs-Matching interessieren uns nur DBIT (outgoing).
+    """
+    bank_account_iban: Optional[str] = None
+    transaction_id: Optional[str] = None
+    end_to_end_id: Optional[str] = None
+    structured_reference: Optional[str] = Field(
+        None,
+        description="QR-Referenz (27-stellig) oder ESR. Goldener Match-Schluessel."
+    )
+    booking_date: date_type
+    value_date: Optional[date_type] = None
+    amount: float = Field(description="Signed: DBIT negativ, CRDT positiv")
+    currency: str = "CHF"
+    direction: str = Field(description="DBIT (outgoing) oder CRDT (incoming)")
+    counterparty_name: Optional[str] = None
+    counterparty_iban: Optional[str] = None
+    remittance_unstructured: Optional[str] = None
+
+    @property
+    def is_outgoing(self) -> bool:
+        return self.direction == "DBIT"
+
+    @property
+    def absolute_amount(self) -> float:
+        return abs(self.amount)
+
+
+class MatchCandidate(BaseModel):
+    """Ein Matching-Vorschlag zwischen Bank-TX und pending_invoice."""
+    pending_invoice_id: str
+    confidence: float = Field(ge=0.0, le=1.0)
+    strategy: str  # 'qr_reference' | 'iban_amount_date' | 'vendor_amount_date'
+    reason: str  # Menschenlesbar warum dieser Match
+    invoice_vendor: Optional[str] = None
+    invoice_amount: Optional[float] = None
+    invoice_reference: Optional[str] = None

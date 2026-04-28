@@ -456,12 +456,61 @@ class BexioClient:
     # =========================================================
     
     async def list_bank_accounts(self) -> List[Dict[str, Any]]:
-        """Listet Bank-Konten. Wird spaeter fuer Zahlungsvorschlaege gebraucht."""
+        """Listet Bank-Konten. Wird fuer Payment-Registrierung gebraucht."""
         try:
             result = await self._request("GET", "/3.0/banking/accounts")
             return result if isinstance(result, list) else []
         except BexioError:
             return []
+
+    async def register_bill_payment(
+        self,
+        bill_id: str,
+        amount: float,
+        value_date: str,
+        bank_account_id: int,
+        currency: str = "CHF",
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Registriert eine Zahlung auf eine Lieferantenrechnung in Bexio v4.
+
+        Damit wird die Bill von "open" auf "paid" gestellt und buchhalterisch
+        die Verbindlichkeit (Konto 2000) gegen das Bank-Konto (z.B. 1020)
+        ausgeglichen.
+
+        Args:
+            bill_id: Bexio-Bill-UUID (z.B. "8dda7fac-...")
+            amount: Bezahlter Betrag (positiv, in der Bill-Waehrung)
+            value_date: Valuta-Datum YYYY-MM-DD (entspricht dem Bank-Booking)
+            bank_account_id: Bexio-interne ID des Bank-Kontos (kein Konto-NR)
+            currency: ISO-Code, default CHF
+
+        Returns:
+            Bexio-Payment-Response (enthaelt mindestens id) oder None bei Fehler.
+        """
+        payload = {
+            "value_date": value_date,
+            "amount": round(float(amount), 2),
+            "currency_code": currency,
+            "bank_account_id": int(bank_account_id),
+        }
+        try:
+            result = await self._request(
+                "POST",
+                f"/4.0/purchase/bills/{bill_id}/payments",
+                json=payload,
+            )
+            payment_id = (result or {}).get("id") if isinstance(result, dict) else None
+            logger.info(
+                f"Bexio Payment registriert: bill={bill_id} amount={amount:.2f} "
+                f"{currency} value_date={value_date} payment_id={payment_id}"
+            )
+            return result if isinstance(result, dict) else None
+        except BexioError as e:
+            logger.error(
+                f"Bexio Payment-Registrierung fehlgeschlagen fuer bill={bill_id}: {e}"
+            )
+            raise
 
 
 # =========================================================
