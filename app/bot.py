@@ -12,7 +12,7 @@ Workflow:
 8. Lernen: Vendor-Mapping wird aktualisiert
 """
 import json
-from typing import Optional
+from typing import Optional, List, Dict, Any
 from datetime import datetime, timezone, timedelta
 
 from telegram import (
@@ -89,10 +89,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     
     await update.message.reply_text(
         "👋 *VisioSkin Accounting Agent*\n\n"
-        "Schick mir eine Rechnung als PDF oder Foto und ich verbuche sie in Bexio.\n\n"
+        "Schick mir eine Rechnung als PDF/Foto - ich verbuche sie in Bexio.\n"
+        "Schick mir eine camt.054-Datei vom Online-Banking - ich gleiche "
+        "Zahlungen automatisch ab.\n\n"
         "*Befehle:*\n"
         "/sync — Bexio-Kontenplan aktualisieren\n"
         "/learn — Aus bestehender Bexio-History lernen\n"
+        "/review — Match-Vorschlaege fuer Bank-Zahlungen durchgehen\n"
         "/stats — Statistik anzeigen\n"
         "/vendors — Gelernte Lieferanten\n"
         "/help — Hilfe\n\n"
@@ -266,33 +269,51 @@ async def cmd_vendors(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # =========================================================
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """PDF oder Bild als Document empfangen."""
+    """PDF, Bild oder camt-Bank-Datei als Document empfangen."""
     if not await _check_auth(update):
         return
-    
+
     doc: Document = update.message.document
-    
+
     # Validierung
     if doc.file_size and doc.file_size > 10 * 1024 * 1024:
         await update.message.reply_text("❌ Datei zu gross (max 10 MB).")
         return
-    
-    mime = doc.mime_type or "application/octet-stream"
+
+    mime = (doc.mime_type or "application/octet-stream").lower()
+    filename = doc.file_name or "document.bin"
+    fname_lower = filename.lower()
+
+    # camt.054 / camt.053: Schweizer Bank-Bewegungs-Datei (XML)
+    is_camt = (
+        fname_lower.endswith((".xml", ".054", ".053"))
+        or "camt" in fname_lower
+        or mime in ("text/xml", "application/xml")
+    )
+
+    if is_camt:
+        await _process_camt_file(
+            update=update,
+            context=context,
+            file_id=doc.file_id,
+            filename=filename,
+        )
+        return
+
     supported = ("application/pdf", "image/jpeg", "image/png", "image/jpg", "image/heic", "image/heif")
-    
     if mime not in supported:
         await update.message.reply_text(
             f"❌ Dateityp `{mime}` nicht unterstuetzt.\n"
-            "Schick PDF, JPG, PNG oder HEIC.",
+            "Schick PDF, JPG, PNG, HEIC oder camt.054/.053 (XML).",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
-    
+
     await _process_invoice_file(
         update=update,
         context=context,
         file_id=doc.file_id,
-        filename=doc.file_name or "document.pdf",
+        filename=filename,
         mime_type=mime,
         file_size=doc.file_size,
     )
@@ -638,7 +659,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     
     data = query.data or ""
     
-    if data.startswith("book:"):
+    if data.startswith("matchbook:"):
+        match_id = data.split(":", 1)[1]
+        await _callback_match_book(query, match_id)
+    elif data.startswith("matchskip:"):
+        match_id = data.split(":", 1)[1]
+        await _callback_match_skip(query, match_id)
+    elif data.startswith("book:"):
         invoice_id = data.split(":", 1)[1]
         await _callback_book(query, invoice_id)
     elif data.startswith("change:"):
@@ -962,6 +989,396 @@ async def _update_vendor_memory(invoice: dict) -> None:
 
 
 # =========================================================
+# BANK-RECONCILIATION (Phase 4)
+# =========================================================
+#
+# Workflow:
+# 1. User schickt camt.054/.053 als Document -> handle_document erkennt
+#    es ueber Filename/MIME und routet zu _process_camt_file
+# 2. _process_camt_file parsed XML -> Liste BankTransaction, speichert in
+#    DB (idempotent), matched gegen offene Pending-Invoices, speichert
+#    Top-1-Vorschlaege als payment_matches.status='proposed'
+# 3. User ruft /review (oder klickt direkt nach Upload) -> Bot zeigt
+#    proposed Matches einen nach dem anderen mit [Buchen]/[Skip]-Buttons
+# 4. Bei Buchen: bexio.register_bill_payment -> Status auf 'booked'
+# 5. Bei Skip: Status auf 'rejected'
+#
+# Voraussetzung: pending_invoice muss bexio_bill_id haben (= bereits in
+# Bexio gebucht). Sonst kann keine Payment registriert werden.
+
+async def _process_camt_file(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    file_id: str,
+    filename: str,
+) -> None:
+    """Lädt camt-Datei aus Telegram, parst, matcht, speichert Vorschlaege."""
+    chat_id = update.effective_chat.id
+
+    status_msg = await update.message.reply_text(
+        f"🏦 Bank-Datei empfangen ({truncate(filename, 40)})\n"
+        f"⏳ Lade herunter…"
+    )
+
+    try:
+        tg_file = await context.bot.get_file(file_id)
+        file_bytes = bytes(await tg_file.download_as_bytearray())
+    except Exception as e:
+        logger.exception(f"camt-Download fehlgeschlagen: {e}")
+        await status_msg.edit_text(
+            f"❌ Download-Fehler: `{truncate(str(e), 150)}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    # Lokale Imports damit Phase-4-Module nur geladen werden wenn gebraucht
+    from app.camt import parse_camt, CamtParseError
+    from app.reconcile import find_matches
+
+    await status_msg.edit_text("🏦 Parse Bank-Bewegungen…")
+
+    try:
+        transactions = parse_camt(file_bytes)
+    except CamtParseError as e:
+        await status_msg.edit_text(
+            f"❌ *camt-Datei nicht lesbar*\n\n`{truncate(str(e), 200)}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    if not transactions:
+        await status_msg.edit_text(
+            "⚠️ Keine Bank-Bewegungen in der Datei gefunden."
+        )
+        return
+
+    outgoing = [tx for tx in transactions if tx.is_outgoing]
+    open_invoices = db.get_open_invoices_for_matching()
+
+    if not open_invoices:
+        await status_msg.edit_text(
+            f"📊 *{len(transactions)} Bewegungen geparst* "
+            f"({len(outgoing)} ausgehend)\n\n"
+            f"ℹ️ Keine offenen Rechnungen in der DB - nichts zu matchen.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    await status_msg.edit_text(
+        f"🏦 {len(transactions)} Bewegungen geparst, {len(outgoing)} ausgehend\n"
+        f"⏳ Matche gegen {len(open_invoices)} offene Rechnungen…"
+    )
+
+    saved_count = 0
+    proposed_count = 0
+    duplicate_count = 0
+
+    for tx in transactions:
+        if not tx.transaction_id:
+            continue
+
+        tx_payload = {
+            "tenant_id": "visioskin",
+            "bank_account_iban": tx.bank_account_iban,
+            "transaction_id": tx.transaction_id,
+            "end_to_end_id": tx.end_to_end_id,
+            "structured_reference": tx.structured_reference,
+            "booking_date": tx.booking_date.isoformat(),
+            "value_date": tx.value_date.isoformat() if tx.value_date else None,
+            "amount": tx.amount,
+            "currency": tx.currency,
+            "direction": tx.direction,
+            "counterparty_name": tx.counterparty_name,
+            "counterparty_iban": tx.counterparty_iban,
+            "remittance_unstructured": tx.remittance_unstructured,
+        }
+        bank_tx_id = db.upsert_bank_transaction(tx_payload)
+        if not bank_tx_id:
+            duplicate_count += 1
+            continue
+        saved_count += 1
+
+        if not tx.is_outgoing:
+            continue
+
+        candidates = find_matches(tx, open_invoices)
+        if not candidates:
+            continue
+
+        top = candidates[0]
+        match_id = db.insert_payment_match({
+            "tenant_id": "visioskin",
+            "bank_transaction_id": bank_tx_id,
+            "pending_invoice_id": top.pending_invoice_id,
+            "confidence": float(top.confidence),
+            "match_strategy": top.strategy,
+            "status": "proposed",
+        })
+        if match_id:
+            proposed_count += 1
+
+    summary = (
+        f"✅ *Bank-Datei verarbeitet*\n\n"
+        f"📊 {saved_count} neue Bewegungen gespeichert\n"
+    )
+    if duplicate_count:
+        summary += f"⏭ {duplicate_count} bereits importiert (uebersprungen)\n"
+    summary += (
+        f"🎯 {proposed_count} Match-Vorschlaege bereit\n\n"
+    )
+    if proposed_count > 0:
+        summary += "Klick auf */review* um sie durchzugehen."
+    else:
+        summary += (
+            "ℹ️ Keine automatischen Matches. Pruefe ob die offenen Rechnungen "
+            "QR-Referenz oder IBAN haben."
+        )
+    await status_msg.edit_text(summary, parse_mode=ParseMode.MARKDOWN)
+
+
+# Cache fuer Bexio-Banking-Account-Lookup. Bexio aendert das selten,
+# deshalb einmal pro Bot-Run reicht.
+_bexio_bank_accounts_cache: Optional[List[Dict[str, Any]]] = None
+
+
+async def _find_bexio_bank_account_id(camt_iban: Optional[str]) -> Optional[int]:
+    """
+    Loest die camt-IBAN des Konto-Eigentuemers in eine Bexio-Banking-
+    Account-ID auf (die wird fuer register_bill_payment gebraucht).
+
+    Strategie:
+    1. Versuch: Bexio-Banking-Account mit gleicher IBAN finden
+    2. Fallback: wenn nur ein Banking-Account existiert, den nehmen
+    3. Sonst: None -> Caller muss Fehler werfen
+    """
+    global _bexio_bank_accounts_cache
+    if _bexio_bank_accounts_cache is None:
+        try:
+            _bexio_bank_accounts_cache = await bexio_module.bexio.list_bank_accounts()
+        except Exception as e:
+            logger.error(f"Bexio Banking-Accounts laden fehlgeschlagen: {e}")
+            return None
+
+    accounts = _bexio_bank_accounts_cache or []
+    if not accounts:
+        return None
+
+    if camt_iban:
+        normalized = camt_iban.replace(" ", "").upper()
+        for a in accounts:
+            iban = (a.get("iban") or "").replace(" ", "").upper()
+            if iban and iban == normalized:
+                return a.get("id")
+
+    # Genau ein Konto -> nehmen
+    if len(accounts) == 1:
+        return accounts[0].get("id")
+
+    return None
+
+
+async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Geht offene Match-Vorschlaege durch (einen nach dem anderen)."""
+    if not await _check_auth(update):
+        return
+
+    proposals = db.get_pending_match_proposals(limit=1)
+    if not proposals:
+        await update.message.reply_text(
+            "✅ Keine offenen Match-Vorschlaege.\n\n"
+            "Schicke eine camt.054-Datei vom Online-Banking um neue zu importieren."
+        )
+        return
+
+    await _show_match_proposal(update.message, proposals[0])
+
+
+async def _show_match_proposal(message_or_query, proposal: Dict[str, Any]) -> None:
+    """Zeigt einen einzelnen Match-Vorschlag mit Aktions-Buttons."""
+    bank_tx = db.get_bank_transaction(proposal["bank_transaction_id"])
+    invoice = db.get_invoice(proposal["pending_invoice_id"])
+
+    if not bank_tx or not invoice:
+        msg = "⚠️ Match-Vorschlag verweist auf geloeschte Daten."
+        if hasattr(message_or_query, "edit_text"):
+            await message_or_query.edit_text(msg)
+        else:
+            await message_or_query.reply_text(msg)
+        return
+
+    confidence_pct = int(float(proposal["confidence"]) * 100)
+    conf_icon = (
+        "🟢" if confidence_pct >= 90
+        else "🟡" if confidence_pct >= 70
+        else "🟠"
+    )
+
+    bank_amt = abs(float(bank_tx["amount"]))
+    inv_amt = float(invoice.get("total_amount") or 0)
+    diff = abs(bank_amt - inv_amt)
+    diff_text = "" if diff < 0.01 else f" (Δ {format_chf(diff)})"
+
+    text = (
+        f"{conf_icon} *Match-Vorschlag* ({confidence_pct}%)\n\n"
+        f"🏦 *Bank-Bewegung:*\n"
+        f"  {format_chf(bank_amt)} an {truncate(bank_tx.get('counterparty_name') or '?', 35)}\n"
+        f"  {bank_tx['booking_date']}"
+    )
+    qr = bank_tx.get("structured_reference")
+    if qr:
+        text += f"\n  QR-Ref ...{qr[-7:]}"
+
+    text += (
+        f"\n\n📄 *Offene Rechnung:*\n"
+        f"  {truncate(invoice.get('vendor_name') or '?', 35)} "
+        f"{format_chf(inv_amt)}{diff_text}\n"
+        f"  {invoice.get('invoice_date') or '?'}"
+    )
+    if invoice.get("invoice_number"):
+        text += f"\n  Nr {truncate(invoice['invoice_number'], 25)}"
+
+    text += f"\n\n_Strategie: `{proposal['match_strategy']}`_"
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "✅ Buchen",
+                callback_data=f"matchbook:{proposal['id']}",
+            ),
+            InlineKeyboardButton(
+                "⏭ Skip",
+                callback_data=f"matchskip:{proposal['id']}",
+            ),
+        ],
+    ]
+
+    if hasattr(message_or_query, "edit_text"):
+        await message_or_query.edit_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    else:
+        await message_or_query.reply_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+
+async def _show_next_match_or_done(query) -> None:
+    """Holt den naechsten offenen Vorschlag oder schliesst den Review-Flow."""
+    next_proposals = db.get_pending_match_proposals(limit=1)
+    if next_proposals:
+        await _show_match_proposal(query.message, next_proposals[0])
+    else:
+        await query.message.reply_text(
+            "✅ Alle Match-Vorschlaege durchgegangen."
+        )
+
+
+async def _callback_match_book(query, match_id: str) -> None:
+    """User bestaetigt Match -> Payment in Bexio registrieren."""
+    proposal = db.get_payment_match(match_id)
+    if not proposal or proposal["status"] != "proposed":
+        await query.edit_message_text("ℹ️ Match nicht mehr aktiv.")
+        return
+
+    bank_tx = db.get_bank_transaction(proposal["bank_transaction_id"])
+    invoice = db.get_invoice(proposal["pending_invoice_id"])
+    if not bank_tx or not invoice:
+        await query.edit_message_text("❌ Bank-TX oder Rechnung fehlt.")
+        db.update_payment_match_status(match_id, "failed",
+                                       error_message="missing tx or invoice")
+        return
+
+    bexio_bill_id = invoice.get("bexio_bill_id")
+    if not bexio_bill_id:
+        await query.edit_message_text(
+            "⚠️ *Rechnung noch nicht in Bexio gebucht*\n\n"
+            "Erst die Lieferantenrechnung normal mit ✅ Buchen abschliessen, "
+            "dann nochmal /review.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        # Bleibt 'proposed' fuer spaeter
+        return
+
+    bank_account_id = await _find_bexio_bank_account_id(
+        bank_tx.get("bank_account_iban")
+    )
+    if not bank_account_id:
+        await query.edit_message_text(
+            "❌ *Bexio-Banking-Account nicht gefunden*\n\n"
+            "Pruefe in Bexio unter Banking ob das Konto verbunden ist und "
+            "eine IBAN hat die mit dem camt-File matcht.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        db.update_payment_match_status(match_id, "failed",
+                                       error_message="no bexio bank account")
+        return
+
+    db.update_payment_match_status(match_id, "confirmed")
+    await query.edit_message_text("⏳ Registriere Zahlung in Bexio…")
+
+    try:
+        result = await bexio_module.bexio.register_bill_payment(
+            bill_id=str(bexio_bill_id),
+            amount=abs(float(bank_tx["amount"])),
+            value_date=bank_tx.get("value_date") or bank_tx["booking_date"],
+            bank_account_id=int(bank_account_id),
+            currency=bank_tx.get("currency") or "CHF",
+        )
+        bexio_payment_id = (result or {}).get("id") if result else None
+        db.update_payment_match_status(
+            match_id,
+            "booked",
+            bexio_payment_id=str(bexio_payment_id) if bexio_payment_id else None,
+        )
+        db.update_bank_transaction_match_status(
+            proposal["bank_transaction_id"], "matched"
+        )
+        db.log_action(
+            invoice["id"],
+            "payment_registered",
+            actor=f"telegram:{query.from_user.id}",
+            details={
+                "match_id": match_id,
+                "bexio_payment_id": str(bexio_payment_id) if bexio_payment_id else None,
+                "amount": abs(float(bank_tx["amount"])),
+                "value_date": bank_tx.get("value_date") or bank_tx["booking_date"],
+            },
+        )
+
+        await query.edit_message_text(
+            f"✅ *Zahlung registriert*\n\n"
+            f"Bill {truncate(str(bexio_bill_id), 12)} -> bezahlt\n"
+            f"{format_chf(abs(float(bank_tx['amount'])))} am "
+            f"{bank_tx.get('value_date') or bank_tx['booking_date']}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        await _show_next_match_or_done(query)
+    except bexio_module.BexioError as e:
+        db.update_payment_match_status(match_id, "failed", error_message=str(e))
+        db.log_action(
+            invoice["id"],
+            "payment_failed",
+            details={"match_id": match_id, "error": str(e)},
+        )
+        await query.edit_message_text(
+            f"❌ *Bexio-Fehler bei Payment-Registration*\n\n"
+            f"`{truncate(str(e), 300)}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+
+async def _callback_match_skip(query, match_id: str) -> None:
+    """User skippt Match -> Status auf 'rejected'."""
+    db.update_payment_match_status(match_id, "rejected")
+    await query.edit_message_text("⏭ Match uebersprungen.")
+    await _show_next_match_or_done(query)
+
+
+# =========================================================
 # FALLBACK FUER NORMALEN TEXT
 # =========================================================
 
@@ -991,6 +1408,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("learn", cmd_learn))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("vendors", cmd_vendors))
+    app.add_handler(CommandHandler("review", cmd_review))
     
     # Dateien
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))

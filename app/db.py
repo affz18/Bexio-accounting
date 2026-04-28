@@ -958,3 +958,37 @@ def update_bank_transaction_match_status(
     except Exception as e:
         logger.error(f"Fehler beim Bank-TX-Status-Update {bank_transaction_id}: {e}")
         return False
+
+
+def get_bank_transaction(bank_transaction_id: str) -> Optional[Dict[str, Any]]:
+    """Holt eine Bank-Transaktion fuer den Match-Display."""
+    try:
+        result = (
+            get_client()
+            .table("bank_transactions")
+            .select("*")
+            .eq("id", bank_transaction_id)
+            .limit(1)
+            .execute()
+        )
+        return result.data[0] if result.data else None
+    except Exception as e:
+        logger.error(f"Fehler beim Laden Bank-TX {bank_transaction_id}: {e}")
+        return None
+
+
+def get_payment_match(match_id: str) -> Optional[Dict[str, Any]]:
+    """Holt einen Match-Vorschlag mit allen Details."""
+    try:
+        result = (
+            get_client()
+            .table("payment_matches")
+            .select("*")
+            .eq("id", match_id)
+            .limit(1)
+            .execute()
+        )
+        return result.data[0] if result.data else None
+    except Exception as e:
+        logger.error(f"Fehler beim Laden Payment-Match {match_id}: {e}")
+        return None
