@@ -49,24 +49,25 @@ logger = setup_logger(__name__)
 async def _check_auth(update: Update) -> bool:
     """
     Prueft ob User berechtigt ist. Sendet Ablehnung wenn nicht.
-    
+
     Check 1: ENV-Whitelist (Bootstrap, damit Bot auch ohne DB-Eintrag startbar ist)
-    Check 2: Supabase authorized_users Tabelle
+    Check 2: Supabase authorized_users Tabelle (tenant-uebergreifend)
     """
     if not update.effective_chat:
         return False
-    
+
     chat_id = update.effective_chat.id
-    
+
     # Check 1: ENV-Whitelist
     env_allowed = settings.allowed_chat_ids_list
     if env_allowed and chat_id in env_allowed:
         return True
-    
-    # Check 2: DB
+
+    # Check 2: DB - ohne tenant_id-Filter, weil ein User in mehreren Tenants
+    # sein kann und wir hier nur "darf reden" pruefen, nicht "welcher Tenant"
     if db.is_user_authorized(chat_id):
         return True
-    
+
     # Nicht authorized
     logger.warning(f"Nicht-autorisierter Zugriff von Chat-ID {chat_id}")
     await update.effective_message.reply_text(
@@ -76,6 +77,25 @@ async def _check_auth(update: Update) -> bool:
         parse_mode=ParseMode.MARKDOWN,
     )
     return False
+
+
+def _resolve_tenant_id(update: Update) -> str:
+    """
+    Loest den Tenant fuer einen Telegram-Update auf.
+
+    Strategie:
+    1. Versuch: DB-Lookup ueber authorized_users (echtes Multi-Tenant-Mapping)
+    2. Fallback: DEFAULT_TENANT_ID
+
+    In Phase B1 hat das System nur einen Tenant ('visioskin'), deshalb landet
+    der Code praktisch immer im Fallback. In Block 1B/C wird das echte
+    Mapping durch Onboarding-Flow gefuettert.
+    """
+    if not update.effective_chat:
+        return db.DEFAULT_TENANT_ID
+    chat_id = update.effective_chat.id
+    resolved = db.resolve_tenant_for_chat(chat_id)
+    return resolved or db.DEFAULT_TENANT_ID
 
 
 # =========================================================
@@ -1228,7 +1248,7 @@ async def _process_camt_file(
             continue
 
         tx_payload = {
-            "tenant_id": "visioskin",
+            "tenant_id": db.DEFAULT_TENANT_ID,
             "bank_account_iban": tx.bank_account_iban,
             "transaction_id": tx.transaction_id,
             "end_to_end_id": tx.end_to_end_id,
@@ -1257,7 +1277,7 @@ async def _process_camt_file(
 
         top = candidates[0]
         match_id = db.insert_payment_match({
-            "tenant_id": "visioskin",
+            "tenant_id": db.DEFAULT_TENANT_ID,
             "bank_transaction_id": bank_tx_id,
             "pending_invoice_id": top.pending_invoice_id,
             "confidence": float(top.confidence),
