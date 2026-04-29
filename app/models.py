@@ -164,3 +164,42 @@ class MatchCandidate(BaseModel):
     invoice_vendor: Optional[str] = None
     invoice_amount: Optional[float] = None
     invoice_reference: Optional[str] = None
+
+
+# =========================================================
+# MULTI-TENANT (Phase B1)
+# =========================================================
+
+class Tenant(BaseModel):
+    """
+    Ein Mandant der den Agenten nutzt. In Phase B1 ist nur der Default-
+    Tenant 'visioskin' aktiv - die Felder unten sind vorbereitet fuer
+    spaetere Multi-Tenant-Operations (OAuth-Token, IMAP-Settings, etc.).
+    """
+    id: str  # text-Slug, z.B. 'visioskin'
+    display_name: str
+    is_active: bool = True
+
+    # Bexio-Anbindung (in Phase B1 noch in Env, kommt spaeter aus DB)
+    bexio_api_token: Optional[str] = None
+    bexio_company_id: Optional[str] = None
+
+    # IMAP (per-Tenant Mailbox)
+    imap_enabled: bool = False
+    imap_host: Optional[str] = None
+    imap_port: int = 993
+    imap_user: Optional[str] = None
+    imap_password: Optional[str] = None
+    imap_folder: str = "INBOX"
+    imap_keywords_regex: Optional[str] = None
+
+    # Notification-Channel
+    telegram_notify_chat_id: Optional[int] = None
+
+    # Privat-bezahlt-Konto
+    private_payment_credit_account_nr: str = "2100"
+
+    # Empfaenger-Validierung (Recipient-Check spaeter)
+    company_name: Optional[str] = None
+    company_uid: Optional[str] = None
+    company_name_aliases: Optional[str] = None  # Komma-separiert
