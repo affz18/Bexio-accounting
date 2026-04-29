@@ -96,6 +96,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/sync — Bexio-Kontenplan aktualisieren\n"
         "/learn — Aus bestehender Bexio-History lernen\n"
         "/review — Match-Vorschlaege fuer Bank-Zahlungen durchgehen\n"
+        "/mwst — Vorsteuer-Bericht fuer ein Quartal\n"
         "/stats — Statistik anzeigen\n"
         "/vendors — Gelernte Lieferanten\n"
         "/help — Hilfe\n\n"
@@ -262,6 +263,155 @@ async def cmd_vendors(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "\n".join(lines),
         parse_mode=ParseMode.MARKDOWN,
     )
+
+
+async def cmd_mwst(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Vorsteuer-Bericht fuer ein Quartal aus Bexio aggregieren.
+    Usage: /mwst 2026Q3   (oder ohne Argument = vorheriges Quartal)
+    """
+    if not await _check_auth(update):
+        return
+
+    from app.mwst import (
+        parse_quarter_string,
+        previous_quarter,
+        build_vat_report,
+    )
+
+    args = context.args if hasattr(context, "args") else []
+    if args:
+        try:
+            year, quarter = parse_quarter_string(" ".join(args))
+        except ValueError as e:
+            await update.message.reply_text(
+                f"❌ {e}\n\nBeispiele: `/mwst 2026Q3` `/mwst Q2 2026` `/mwst 2026/3`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+    else:
+        year, quarter = previous_quarter()
+
+    msg = await update.message.reply_text(
+        f"🧾 *MwSt-Vorsteuer-Bericht {year}Q{quarter}*\n\n"
+        f"Lade Bills aus Bexio…\n"
+        f"_Das kann je nach Volumen 1-3 Minuten dauern._",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    last_status: Dict[str, str] = {"text": ""}
+
+    async def _progress(text: str) -> None:
+        # Throttling: nur updaten wenn Text sich aendert (Telegram lehnt
+        # gleiche Edits ab)
+        if text == last_status["text"]:
+            return
+        last_status["text"] = text
+        try:
+            await msg.edit_text(
+                f"🧾 *MwSt-Bericht {year}Q{quarter}*\n\n_{truncate(text, 100)}_",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            pass
+
+    try:
+        report = await build_vat_report(year, quarter, progress=_progress)
+    except Exception as e:
+        logger.exception(f"VAT-Report-Aufbau fehlgeschlagen: {e}")
+        await msg.edit_text(
+            f"❌ *Fehler beim MwSt-Bericht*\n\n`{truncate(str(e), 300)}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    # Report formatieren
+    lines = [
+        f"🧾 *MwSt-Vorsteuer-Bericht {report.quarter_label}*",
+        f"_{report.period_start.isoformat()} bis {report.period_end.isoformat()}_",
+        "",
+        f"📋 Bills verarbeitet: {report.bills_processed}",
+    ]
+    if report.bills_skipped:
+        lines.append(f"⏭ Bills uebersprungen: {report.bills_skipped}")
+
+    if not report.lines:
+        lines.append("")
+        lines.append("ℹ️ Keine Lieferantenrechnungen mit MwSt im Quartal gefunden.")
+    else:
+        lines.append("")
+        lines.append("*Aufschluesselung pro MwSt-Code & Konto-Klasse:*")
+        lines.append("```")
+        lines.append(f"{'Code':<8} {'Klasse':<14} {'Brutto':>10} {'MwSt':>9}")
+        for vl in report.sorted_lines():
+            klass_short = {
+                "material": "Mat (4xxx)",
+                "investitionen": "Inv (5-8)",
+                "unclassified": "?",
+            }.get(vl.account_class, "?")
+            lines.append(
+                f"{vl.tax_code:<8} {klass_short:<14} "
+                f"{vl.total_gross:>10.2f} {vl.total_vat:>9.2f}"
+            )
+        lines.append("```")
+
+        lines.append("")
+        lines.append("*ESTV Vorsteuer-Summen:*")
+        lines.append(
+            f"Ziffer 400 (Material/Waren/DL, 4xxx): "
+            f"`{format_chf(report.vorsteuer_material)}`"
+        )
+        lines.append(
+            f"Ziffer 405 (Investitionen, 5-8xxx): "
+            f"`{format_chf(report.vorsteuer_investitionen)}`"
+        )
+        if report.vorsteuer_unclassified:
+            lines.append(
+                f"⚠️ Unklassifiziert (Konten ausserhalb 4-8): "
+                f"`{format_chf(report.vorsteuer_unclassified)}`"
+            )
+        lines.append("")
+        lines.append(
+            f"*Total Vorsteuer:* `{format_chf(report.total_vat)}`"
+        )
+
+    if report.warnings:
+        lines.append("")
+        lines.append(f"⚠️ *{len(report.warnings)} Warnungen:*")
+        for w in report.warnings[:8]:
+            lines.append(f"• {truncate(w, 100)}")
+        if len(report.warnings) > 8:
+            lines.append(f"_…und {len(report.warnings) - 8} weitere._")
+
+    lines.append("")
+    lines.append(
+        "_Werte mit Bexio's MwSt-Auswertung vergleichen "
+        "(Buchhaltung → Auswertungen → MWST-Abrechnung) bevor an ESTV einreichen._"
+    )
+
+    db.log_action(
+        None,
+        "mwst_report",
+        actor=f"telegram:{update.effective_chat.id}",
+        details={
+            "year": year,
+            "quarter": quarter,
+            "bills_processed": report.bills_processed,
+            "total_vat": round(report.total_vat, 2),
+            "vorsteuer_material": round(report.vorsteuer_material, 2),
+            "vorsteuer_investitionen": round(report.vorsteuer_investitionen, 2),
+        },
+    )
+
+    text = "\n".join(lines)
+    # Telegram-Message-Limit: 4096 Zeichen
+    if len(text) > 4000:
+        text = text[:3950] + "\n\n…_(gekuerzt)_"
+    try:
+        await msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logger.error(f"MwSt-Report-Edit fehlgeschlagen: {e}")
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 
 # =========================================================
@@ -1409,6 +1559,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("vendors", cmd_vendors))
     app.add_handler(CommandHandler("review", cmd_review))
+    app.add_handler(CommandHandler("mwst", cmd_mwst))
     
     # Dateien
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
