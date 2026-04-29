@@ -16,6 +16,16 @@ from app.models import VendorMemory, Tenant
 logger = setup_logger(__name__)
 
 
+# =========================================================
+# MULTI-TENANT (Phase B1)
+# =========================================================
+# Default-Tenant fuer Code-Pfade die noch nicht tenant-aware sind.
+# Alle DB-Funktionen akzeptieren tenant_id als Parameter mit diesem Default,
+# sodass alter Code unveraendert weiter laeuft (gegen den 'visioskin'-Tenant)
+# und neuer Multi-Tenant-Code explizit eine andere ID uebergeben kann.
+DEFAULT_TENANT_ID = "visioskin"
+
+
 # Singleton-Client - einmal initialisiert, ueberall genutzt
 _client: Optional[Client] = None
 
@@ -36,34 +46,45 @@ def get_client() -> Client:
 # AUTHORIZED USERS
 # =========================================================
 
-def is_user_authorized(telegram_chat_id: int) -> bool:
-    """Prueft ob ein User den Bot nutzen darf (via DB)."""
+def is_user_authorized(
+    telegram_chat_id: int,
+    tenant_id: Optional[str] = None,
+) -> bool:
+    """
+    Prueft ob ein User den Bot nutzen darf (via DB).
+    Ohne tenant_id: prueft ueber alle Tenants (fuer Bot-Auth ohne Kontext).
+    """
     try:
-        result = (
+        query = (
             get_client()
             .table("authorized_users")
             .select("id")
             .eq("telegram_chat_id", telegram_chat_id)
-            .limit(1)
-            .execute()
         )
+        if tenant_id:
+            query = query.eq("tenant_id", tenant_id)
+        result = query.limit(1).execute()
         return len(result.data) > 0
     except Exception as e:
         logger.error(f"Fehler beim Auth-Check: {e}")
         return False
 
 
-def get_user_settings(telegram_chat_id: int) -> Optional[Dict[str, Any]]:
+def get_user_settings(
+    telegram_chat_id: int,
+    tenant_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     """Holt die User-Settings (kann_auto_book etc.)."""
     try:
-        result = (
+        query = (
             get_client()
             .table("authorized_users")
             .select("*")
             .eq("telegram_chat_id", telegram_chat_id)
-            .limit(1)
-            .execute()
         )
+        if tenant_id:
+            query = query.eq("tenant_id", tenant_id)
+        result = query.limit(1).execute()
         return result.data[0] if result.data else None
     except Exception as e:
         logger.error(f"Fehler beim Laden User-Settings: {e}")
@@ -74,17 +95,21 @@ def get_user_settings(telegram_chat_id: int) -> Optional[Dict[str, Any]]:
 # VENDORS (Lieferanten-Memory)
 # =========================================================
 
-def find_vendor_by_name(name: str) -> Optional[VendorMemory]:
+def find_vendor_by_name(
+    name: str,
+    tenant_id: str = DEFAULT_TENANT_ID,
+) -> Optional[VendorMemory]:
     """Sucht einen Lieferanten ueber den normalisierten Namen."""
     normalized = normalize_vendor_name(name)
     if not normalized:
         return None
-    
+
     try:
         result = (
             get_client()
             .table("vendors")
             .select("*")
+            .eq("tenant_id", tenant_id)
             .eq("normalized_name", normalized)
             .limit(1)
             .execute()
@@ -97,7 +122,10 @@ def find_vendor_by_name(name: str) -> Optional[VendorMemory]:
         return None
 
 
-def find_vendor_by_bexio_contact_id(bexio_contact_id: int) -> Optional[VendorMemory]:
+def find_vendor_by_bexio_contact_id(
+    bexio_contact_id: int,
+    tenant_id: str = DEFAULT_TENANT_ID,
+) -> Optional[VendorMemory]:
     """Sucht Vendor ueber die Bexio-Contact-ID (eindeutige Verknuepfung)."""
     if not bexio_contact_id:
         return None
@@ -106,6 +134,7 @@ def find_vendor_by_bexio_contact_id(bexio_contact_id: int) -> Optional[VendorMem
             get_client()
             .table("vendors")
             .select("*")
+            .eq("tenant_id", tenant_id)
             .eq("bexio_contact_id", bexio_contact_id)
             .limit(1)
             .execute()
@@ -118,19 +147,23 @@ def find_vendor_by_bexio_contact_id(bexio_contact_id: int) -> Optional[VendorMem
         return None
 
 
-def find_vendor_by_iban(iban: str) -> Optional[VendorMemory]:
+def find_vendor_by_iban(
+    iban: str,
+    tenant_id: str = DEFAULT_TENANT_ID,
+) -> Optional[VendorMemory]:
     """Fallback-Suche ueber IBAN falls Name nicht exakt matcht."""
     if not iban:
         return None
-    
+
     # IBAN normalisieren (Leerzeichen weg, uppercase)
     clean_iban = iban.replace(" ", "").upper()
-    
+
     try:
         result = (
             get_client()
             .table("vendors")
             .select("*")
+            .eq("tenant_id", tenant_id)
             .eq("iban", clean_iban)
             .limit(1)
             .execute()
@@ -152,10 +185,12 @@ def create_vendor(
     default_tax_rate: Optional[float] = None,
     iban: Optional[str] = None,
     uid_nummer: Optional[str] = None,
+    tenant_id: str = DEFAULT_TENANT_ID,
 ) -> Optional[VendorMemory]:
     """Legt einen neuen Lieferanten in der Memory an."""
     try:
         payload = {
+            "tenant_id": tenant_id,
             "name": name,
             "normalized_name": normalize_vendor_name(name),
             "bexio_contact_id": bexio_contact_id,
@@ -248,6 +283,7 @@ def upsert_vendor_from_history(
     booking_count: int = 1,
     last_booked_at: Optional[str] = None,
     iban: Optional[str] = None,
+    tenant_id: str = DEFAULT_TENANT_ID,
 ) -> Optional[str]:
     """
     Upsert eines Vendors basierend auf Bexio-History.
@@ -261,9 +297,13 @@ def upsert_vendor_from_history(
     """
     bexio_confidence = min(0.50 + (booking_count * 0.05), 0.95)
 
-    existing = find_vendor_by_bexio_contact_id(bexio_contact_id) or find_vendor_by_name(name)
+    existing = (
+        find_vendor_by_bexio_contact_id(bexio_contact_id, tenant_id=tenant_id)
+        or find_vendor_by_name(name, tenant_id=tenant_id)
+    )
 
     base_payload: Dict[str, Any] = {
+        "tenant_id": tenant_id,
         "name": name,
         "normalized_name": normalize_vendor_name(name),
         "bexio_contact_id": bexio_contact_id,
@@ -319,13 +359,17 @@ def upsert_vendor_from_history(
         return None
 
 
-def list_vendors(limit: int = 50) -> List[VendorMemory]:
+def list_vendors(
+    limit: int = 50,
+    tenant_id: str = DEFAULT_TENANT_ID,
+) -> List[VendorMemory]:
     """Listet alle gelernten Lieferanten, sortiert nach letzter Buchung."""
     try:
         result = (
             get_client()
             .table("vendors")
             .select("*")
+            .eq("tenant_id", tenant_id)
             .order("last_booked_at", desc=True, nullsfirst=False)
             .limit(limit)
             .execute()
@@ -340,7 +384,10 @@ def list_vendors(limit: int = 50) -> List[VendorMemory]:
 # ACCOUNT MAPPINGS (Bexio Kontenplan Cache)
 # =========================================================
 
-def sync_accounts(accounts: List[Dict[str, Any]]) -> int:
+def sync_accounts(
+    accounts: List[Dict[str, Any]],
+    tenant_id: str = DEFAULT_TENANT_ID,
+) -> int:
     """
     Upsert aller Konten aus Bexio in den lokalen Cache.
     accounts: Liste von Dicts im Bexio-Format.
@@ -350,6 +397,7 @@ def sync_accounts(accounts: List[Dict[str, Any]]) -> int:
         payloads = []
         for acc in accounts:
             payloads.append({
+                "tenant_id": tenant_id,
                 "bexio_account_id": acc["id"],
                 "account_nr": str(acc.get("account_no", "")),
                 "account_name": acc.get("name", ""),
@@ -357,19 +405,19 @@ def sync_accounts(accounts: List[Dict[str, Any]]) -> int:
                 "is_active": acc.get("is_active", True),
                 "synced_at": datetime.now(timezone.utc).isoformat(),
             })
-        
+
         if not payloads:
             return 0
-        
-        # Upsert via bexio_account_id (unique)
+
+        # Upsert via (tenant_id, bexio_account_id) - unique pro Tenant
         result = (
             get_client()
             .table("account_mappings")
-            .upsert(payloads, on_conflict="bexio_account_id")
+            .upsert(payloads, on_conflict="tenant_id,bexio_account_id")
             .execute()
         )
         count = len(result.data) if result.data else 0
-        logger.info(f"{count} Konten synchronisiert")
+        logger.info(f"{count} Konten synchronisiert (tenant={tenant_id})")
         return count
     except Exception as e:
         logger.error(f"Fehler beim Account-Sync: {e}")
@@ -396,13 +444,16 @@ def _account_type_label(type_id: Optional[int]) -> str:
     return mapping.get(type_id, "unknown")
 
 
-def get_expense_accounts() -> List[Dict[str, Any]]:
+def get_expense_accounts(
+    tenant_id: str = DEFAULT_TENANT_ID,
+) -> List[Dict[str, Any]]:
     """Holt alle Aufwandskonten aus dem Cache."""
     try:
         result = (
             get_client()
             .table("account_mappings")
             .select("*")
+            .eq("tenant_id", tenant_id)
             .eq("account_type", "expense")
             .eq("is_active", True)
             .order("account_nr")
@@ -414,13 +465,16 @@ def get_expense_accounts() -> List[Dict[str, Any]]:
         return []
 
 
-def get_all_accounts() -> List[Dict[str, Any]]:
+def get_all_accounts(
+    tenant_id: str = DEFAULT_TENANT_ID,
+) -> List[Dict[str, Any]]:
     """Holt alle aktiven Konten aus dem Cache."""
     try:
         result = (
             get_client()
             .table("account_mappings")
             .select("*")
+            .eq("tenant_id", tenant_id)
             .eq("is_active", True)
             .order("account_nr")
             .execute()
@@ -435,12 +489,16 @@ def get_all_accounts() -> List[Dict[str, Any]]:
 # TAX MAPPINGS (MwSt-Codes Cache)
 # =========================================================
 
-def sync_taxes(taxes: List[Dict[str, Any]]) -> int:
+def sync_taxes(
+    taxes: List[Dict[str, Any]],
+    tenant_id: str = DEFAULT_TENANT_ID,
+) -> int:
     """Upsert aller MwSt-Codes aus Bexio."""
     try:
         payloads = []
         for tax in taxes:
             payloads.append({
+                "tenant_id": tenant_id,
                 "bexio_tax_id": tax["id"],
                 "tax_code": tax.get("code", ""),
                 "tax_name": tax.get("name", ""),
@@ -449,25 +507,27 @@ def sync_taxes(taxes: List[Dict[str, Any]]) -> int:
                 "is_active": tax.get("is_active", True),
                 "synced_at": datetime.now(timezone.utc).isoformat(),
             })
-        
+
         if not payloads:
             return 0
-        
+
         result = (
             get_client()
             .table("tax_mappings")
-            .upsert(payloads, on_conflict="bexio_tax_id")
+            .upsert(payloads, on_conflict="tenant_id,bexio_tax_id")
             .execute()
         )
         count = len(result.data) if result.data else 0
-        logger.info(f"{count} MwSt-Codes synchronisiert")
+        logger.info(f"{count} MwSt-Codes synchronisiert (tenant={tenant_id})")
         return count
     except Exception as e:
         logger.error(f"Fehler beim Tax-Sync: {e}")
         return 0
 
 
-def get_input_tax_codes() -> List[Dict[str, Any]]:
+def get_input_tax_codes(
+    tenant_id: str = DEFAULT_TENANT_ID,
+) -> List[Dict[str, Any]]:
     """
     Vorsteuer-Codes (Eingangsrechnungen) holen.
     Bexio unterscheidet pre_tax (Vorsteuer, Kreditoren) und sales_tax
@@ -479,6 +539,7 @@ def get_input_tax_codes() -> List[Dict[str, Any]]:
             get_client()
             .table("tax_mappings")
             .select("*")
+            .eq("tenant_id", tenant_id)
             .eq("is_active", True)
             .eq("tax_type", "pre_tax")
             .order("tax_rate", desc=True)
@@ -526,10 +587,12 @@ def create_pending_invoice(
     file_size_bytes: Optional[int] = None,
     file_mime_type: Optional[str] = None,
     source_reference: Optional[str] = None,
+    tenant_id: str = DEFAULT_TENANT_ID,
 ) -> Optional[str]:
     """Erstellt einen neuen Pending-Invoice Eintrag. Returns: invoice_id oder None."""
     try:
         payload = {
+            "tenant_id": tenant_id,
             "source": source,
             "file_path": file_path,
             "original_filename": original_filename,
@@ -674,34 +737,45 @@ def mark_invoice_failed(invoice_id: str, error_message: str) -> bool:
         return False
 
 
-def get_invoice(invoice_id: str) -> Optional[Dict[str, Any]]:
-    """Holt einen einzelnen Pending-Invoice Eintrag."""
+def get_invoice(
+    invoice_id: str,
+    tenant_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Holt einen einzelnen Pending-Invoice Eintrag.
+    Mit tenant_id: filtert zusaetzlich (defense-in-depth gegen ID-Kollisionen
+    wenn verschiedene Tenants Invoices haben). Ohne: nur via id-PK.
+    """
     try:
-        result = (
+        query = (
             get_client()
             .table("pending_invoices")
             .select("*")
             .eq("id", invoice_id)
-            .limit(1)
-            .execute()
         )
+        if tenant_id:
+            query = query.eq("tenant_id", tenant_id)
+        result = query.limit(1).execute()
         return result.data[0] if result.data else None
     except Exception as e:
         logger.error(f"Fehler beim Laden Invoice {invoice_id}: {e}")
         return None
 
 
-def get_stats() -> Dict[str, int]:
+def get_stats(
+    tenant_id: str = DEFAULT_TENANT_ID,
+) -> Dict[str, int]:
     """Statistik fuer /stats Command."""
     try:
         result = (
             get_client()
             .table("pending_invoices")
             .select("status", count="exact")
+            .eq("tenant_id", tenant_id)
             .execute()
         )
         all_invoices = result.data or []
-        
+
         stats = {
             "total": len(all_invoices),
             "booked": sum(1 for i in all_invoices if i["status"] == "booked"),
@@ -724,10 +798,12 @@ def log_action(
     action: str,
     actor: str = "system",
     details: Optional[Dict[str, Any]] = None,
+    tenant_id: str = DEFAULT_TENANT_ID,
 ) -> bool:
     """Fuegt einen Eintrag ins Audit-Log ein."""
     try:
         payload = {
+            "tenant_id": tenant_id,
             "invoice_id": invoice_id,
             "action": action,
             "actor": actor,
@@ -750,13 +826,19 @@ def log_action(
 # IMAP PROCESSED EMAILS (Idempotenz fuer Inbox-Scan)
 # =========================================================
 
-def is_email_uid_processed(uid: str, folder: str = "INBOX", account: str = "") -> bool:
-    """True, wenn diese (account, folder, uid)-Kombi bereits verarbeitet wurde."""
+def is_email_uid_processed(
+    uid: str,
+    folder: str = "INBOX",
+    account: str = "",
+    tenant_id: str = DEFAULT_TENANT_ID,
+) -> bool:
+    """True, wenn diese (tenant, account, folder, uid)-Kombi bereits verarbeitet wurde."""
     try:
         result = (
             get_client()
             .table("processed_emails")
             .select("uid")
+            .eq("tenant_id", tenant_id)
             .eq("account", account)
             .eq("folder", folder)
             .eq("uid", uid)
@@ -780,6 +862,7 @@ def mark_email_uid_processed(
     subject: Optional[str] = None,
     from_address: Optional[str] = None,
     error: Optional[str] = None,
+    tenant_id: str = DEFAULT_TENANT_ID,
 ) -> bool:
     """
     Markiert eine IMAP-Mail als verarbeitet.
@@ -787,6 +870,7 @@ def mark_email_uid_processed(
     """
     try:
         payload = {
+            "tenant_id": tenant_id,
             "uid": uid,
             "folder": folder,
             "account": account,
@@ -799,7 +883,7 @@ def mark_email_uid_processed(
         (
             get_client()
             .table("processed_emails")
-            .upsert(payload, on_conflict="account,folder,uid")
+            .upsert(payload, on_conflict="tenant_id,account,folder,uid")
             .execute()
         )
         return True
@@ -813,7 +897,7 @@ def mark_email_uid_processed(
 # =========================================================
 
 def get_open_invoices_for_matching(
-    tenant_id: str = "visioskin",
+    tenant_id: str = DEFAULT_TENANT_ID,
     limit: int = 500,
 ) -> List[Dict[str, Any]]:
     """
@@ -886,7 +970,7 @@ def insert_payment_match(match_payload: Dict[str, Any]) -> Optional[str]:
 
 
 def get_pending_match_proposals(
-    tenant_id: str = "visioskin",
+    tenant_id: str = DEFAULT_TENANT_ID,
     limit: int = 100,
 ) -> List[Dict[str, Any]]:
     """Liefert alle vom System vorgeschlagenen, noch nicht bestaetigten Matches."""
@@ -1001,11 +1085,7 @@ def get_payment_match(match_id: str) -> Optional[Dict[str, Any]]:
 # Diese Helpers lesen die tenants-Tabelle. In Phase B1 hat das System nur
 # den Default-Tenant 'visioskin'. Die get-Funktionen sind cached weil
 # Tenant-Daten sich quasi nie aendern.
-
-# Default-Tenant-ID (aus Migration 003 - der einzige Tenant der hier am
-# Start existiert). Code der einen Tenant-Kontext braucht, aber noch nicht
-# Multi-Tenant-faehig ist, kann diese ID nehmen.
-DEFAULT_TENANT_ID = "visioskin"
+# DEFAULT_TENANT_ID ist oben in der Datei definiert (wegen Reihenfolge).
 
 _tenant_cache: Dict[str, Tenant] = {}
 
