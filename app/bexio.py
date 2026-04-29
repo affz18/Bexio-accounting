@@ -27,14 +27,17 @@ class BexioClient:
     """
     Async HTTP-Client fuer Bexio API.
     Nutzt einen persistenten httpx.AsyncClient fuer Connection-Pooling.
+
+    Pro Tenant existiert ein eigener Client mit dem Tenant-spezifischen
+    API-Token. Die Pool-Verwaltung liegt unten (client_for_tenant).
     """
-    
-    def __init__(self):
-        self.base_url = settings.bexio_api_base_url.rstrip("/")
+
+    def __init__(self, api_token: Optional[str] = None, base_url: Optional[str] = None):
+        self.base_url = (base_url or settings.bexio_api_base_url).rstrip("/")
         self.headers = {
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {settings.bexio_api_token}",
+            "Authorization": f"Bearer {api_token or settings.bexio_api_token}",
         }
         self._client: Optional[httpx.AsyncClient] = None
     
@@ -514,9 +517,114 @@ class BexioClient:
 
 
 # =========================================================
-# SINGLETON-INSTANZ
+# MULTI-TENANT POOL + PROXY (Block 1C)
 # =========================================================
+#
+# Statt eines globalen Singleton fuehren wir einen Pool von BexioClients
+# pro Tenant. Welcher Client beim Aufruf von `bexio.X()` zum Zug kommt,
+# entscheidet die ContextVar `_current_tenant_id`.
+#
+# Verhalten in Phase B1: ContextVar default = DEFAULT_TENANT_ID =
+# 'visioskin', und der visioskin-Tenant hat im DB-Eintrag (vorerst)
+# keinen api_token - dann fallen wir zurueck auf den Env-Token. Damit
+# laeuft der Code unveraendert weiter.
+#
+# Sobald wir mehrere Tenants haben, setzt jeder Telegram-Handler beim
+# Eintritt das ContextVar via set_current_tenant(...) und alle
+# bexio_module.bexio.X()-Aufrufe routen automatisch.
+#
+# Hintergrund-Tasks (IMAP-Poller) muessen das ContextVar pro Iteration
+# explizit setzen.
 
-# Ein globaler Client fuer die ganze App.
-# Import und nutzen: `from app.bexio import bexio; await bexio.list_accounts()`
-bexio = BexioClient()
+from contextvars import ContextVar
+
+
+_current_tenant_id: ContextVar[str] = ContextVar(
+    "bexio_current_tenant_id",
+    default="visioskin",
+)
+
+_client_pool: Dict[str, BexioClient] = {}
+
+
+def set_current_tenant(tenant_id: str) -> None:
+    """Setzt den aktiven Tenant fuer alle nachfolgenden bexio.X()-Calls
+    in diesem Async-Context (Telegram-Handler, IMAP-Iteration, etc.)."""
+    _current_tenant_id.set(tenant_id)
+
+
+def get_current_tenant() -> str:
+    """Liest den aktiven Tenant aus dem ContextVar."""
+    return _current_tenant_id.get()
+
+
+def _build_client_for_tenant(tenant_id: str) -> BexioClient:
+    """
+    Baut einen BexioClient fuer einen konkreten Tenant.
+    - Token kommt aus tenants.bexio_api_token in Supabase
+    - Fallback fuer den Default-Tenant: settings.bexio_api_token (Env)
+    """
+    # Lokaler Import damit kein Circular bei Modul-Laden entsteht
+    from app import db  # noqa: WPS433
+
+    api_token: Optional[str] = None
+    tenant = db.get_tenant(tenant_id)
+    if tenant and tenant.bexio_api_token:
+        api_token = tenant.bexio_api_token
+    elif tenant_id == db.DEFAULT_TENANT_ID:
+        # Default-Tenant: Env-Token als Fallback (Migration-Pfad)
+        api_token = settings.bexio_api_token
+
+    if not api_token:
+        raise BexioError(
+            f"Kein Bexio-API-Token fuer Tenant '{tenant_id}'. "
+            f"Setze tenants.bexio_api_token in Supabase oder ENV bei Default-Tenant."
+        )
+
+    return BexioClient(api_token=api_token)
+
+
+def client_for_tenant(tenant_id: str) -> BexioClient:
+    """Holt (oder erstellt) den BexioClient fuer einen Tenant - cached."""
+    cached = _client_pool.get(tenant_id)
+    if cached is not None:
+        return cached
+    client = _build_client_for_tenant(tenant_id)
+    _client_pool[tenant_id] = client
+    return client
+
+
+def reset_client_pool() -> None:
+    """Leert den Pool (z.B. nach Token-Aenderung in DB). Cleanup obliegt
+    dem Caller - die HTTP-Clients schliessen sich beim GC selbst."""
+    global _client_pool
+    _client_pool = {}
+
+
+async def close_all() -> None:
+    """Graceful Shutdown - schliesst alle Clients im Pool."""
+    for tenant_id, client in list(_client_pool.items()):
+        try:
+            await client.close()
+        except Exception as e:
+            logger.warning(f"Bexio-Client-Close fuer {tenant_id} fehlgeschlagen: {e}")
+    reset_client_pool()
+
+
+class _BexioProxy:
+    """
+    Drop-in-Replacement fuer den frueheren Singleton.
+
+    `bexio_module.bexio.list_accounts()` routet automatisch zum Client des
+    aktuellen Tenants (gemaess ContextVar). Existierender Code aendert
+    sich dadurch nicht.
+    """
+
+    def __getattr__(self, name: str):
+        client = client_for_tenant(_current_tenant_id.get())
+        return getattr(client, name)
+
+
+# Backwards-kompatibler Singleton-Name. Verhaelt sich wie ein BexioClient,
+# delegiert aber an den Pool.
+bexio = _BexioProxy()
