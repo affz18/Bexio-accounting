@@ -1,32 +1,28 @@
 import Link from "next/link";
+import { notFound } from "next/navigation";
 import { ArrowLeft, FileText, ExternalLink, Download } from "lucide-react";
 import { formatCHF, formatDate, statusVariant, cn } from "@/lib/utils";
+import { getInvoiceById, getInvoiceFileUrl } from "@/lib/queries";
 
-// MOCK
-const MOCK_INVOICE = {
-  id: "1",
-  vendor_name: "SwissPlakat AG",
-  invoice_number: "INV-2026-001",
-  invoice_date: "2026-04-25",
-  due_date: "2026-05-25",
-  total_amount: 659.40,
-  vat_amount: 49.49,
-  vat_rate: 8.1,
-  currency: "CHF",
-  iban: "CH4800024024C9300062H",
-  reference_number: "210000000003139471430009017",
-  uid_number: "CHE-123.456.789",
-  status: "booked",
-  bexio_bill_id: "8dda7fac-0a7b-411d-b5a4-191dbe6eb84e",
-  source: "telegram",
-  suggested_account_nr: "6500",
-  suggested_account_name: "Bueromaterial",
-  suggested_tax_code: "VSTN",
-};
+export const dynamic = "force-dynamic";
 
-export default function InvoiceDetailPage({ params }: { params: { id: string } }) {
-  const inv = MOCK_INVOICE;
+export default async function InvoiceDetailPage({
+  params,
+}: {
+  params: { id: string };
+}) {
+  const inv = await getInvoiceById(params.id);
+
+  if (!inv) {
+    notFound();
+  }
+
+  const fileUrl = await getInvoiceFileUrl(inv.file_path);
   const variant = statusVariant(inv.status);
+  const isPdf =
+    inv.file_mime_type?.includes("pdf") ||
+    inv.original_filename?.toLowerCase().endsWith(".pdf");
+  const isImage = inv.file_mime_type?.startsWith("image/");
 
   return (
     <div className="space-y-6">
@@ -37,41 +33,78 @@ export default function InvoiceDetailPage({ params }: { params: { id: string } }
         <ArrowLeft className="w-3 h-3" /> Zurueck zu Belege
       </Link>
 
-      <div className="flex items-start justify-between">
+      <div className="flex items-start justify-between gap-4 flex-wrap">
         <div>
-          <h1 className="text-3xl font-semibold tracking-tight">{inv.vendor_name}</h1>
-          <p className="mt-1 text-foreground-muted font-mono text-sm">
-            {inv.invoice_number}
-          </p>
+          <h1 className="text-3xl font-semibold tracking-tight">
+            {inv.vendor_name || "Unbekannter Lieferant"}
+          </h1>
+          {inv.invoice_number && (
+            <p className="mt-1 text-foreground-muted font-mono text-sm">
+              {inv.invoice_number}
+            </p>
+          )}
         </div>
         <span className={cn("badge", variant.className)}>{variant.label}</span>
       </div>
 
-      <div className="grid grid-cols-3 gap-6">
-        {/* PDF-Preview links */}
-        <div className="col-span-2 card overflow-hidden">
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        {/* PDF / Image-Preview links */}
+        <div className="lg:col-span-2 card overflow-hidden">
           <div className="px-6 py-4 border-b border-border flex items-center justify-between">
-            <div className="font-medium">Beleg</div>
+            <div className="font-medium truncate">
+              {inv.original_filename || "Beleg"}
+            </div>
             <div className="flex items-center gap-2">
-              <button className="btn-ghost text-xs">
-                <Download className="w-3 h-3" /> Original
-              </button>
-              <Link
-                href={`https://bexio.com/bills/${inv.bexio_bill_id}`}
-                target="_blank"
-                className="btn-ghost text-xs"
-              >
-                <ExternalLink className="w-3 h-3" /> In Bexio
-              </Link>
+              {fileUrl && (
+                <a
+                  href={fileUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="btn-ghost text-xs"
+                >
+                  <Download className="w-3 h-3" /> Original
+                </a>
+              )}
+              {inv.bexio_bill_id && (
+                <a
+                  href={`https://office.bexio.com/index.php/kb_bill/show/id/${inv.bexio_bill_id}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="btn-ghost text-xs"
+                >
+                  <ExternalLink className="w-3 h-3" /> In Bexio
+                </a>
+              )}
             </div>
           </div>
-          <div className="aspect-[3/4] bg-background flex items-center justify-center text-foreground-subtle">
-            <div className="text-center">
-              <FileText className="w-12 h-12 mx-auto" />
-              <div className="mt-2 text-sm">PDF-Preview</div>
-              <div className="text-xs">In Block 1D direkt aus Supabase Storage</div>
+
+          {fileUrl && isPdf && (
+            <iframe
+              src={fileUrl}
+              className="w-full"
+              style={{ height: "70vh" }}
+              title="Beleg PDF"
+            />
+          )}
+          {fileUrl && isImage && (
+            <div className="bg-background flex items-center justify-center">
+              {/* Server-Component, kein next/image notwendig */}
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={fileUrl}
+                alt={inv.original_filename || "Beleg"}
+                className="max-h-[70vh] w-auto"
+              />
             </div>
-          </div>
+          )}
+          {!fileUrl && (
+            <div className="aspect-[3/4] bg-background flex items-center justify-center text-foreground-subtle">
+              <div className="text-center">
+                <FileText className="w-12 h-12 mx-auto" />
+                <div className="mt-2 text-sm">Beleg nicht verfuegbar</div>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Daten rechts */}
@@ -81,40 +114,109 @@ export default function InvoiceDetailPage({ params }: { params: { id: string } }
             <div className="mt-2 text-2xl font-semibold">
               {formatCHF(inv.total_amount)}
             </div>
-            <div className="mt-1 text-xs text-foreground-muted">
-              davon MwSt {inv.vat_rate}%: {formatCHF(inv.vat_amount)}
-            </div>
+            {inv.vat_amount !== null && inv.vat_rate !== null && (
+              <div className="mt-1 text-xs text-foreground-muted">
+                davon MwSt {inv.vat_rate}%: {formatCHF(inv.vat_amount)}
+              </div>
+            )}
           </div>
 
           <div className="card p-5 space-y-3 text-sm">
             <h3 className="font-medium">Buchungs-Details</h3>
-            <DataRow label="Konto" value={`${inv.suggested_account_nr} ${inv.suggested_account_name}`} />
-            <DataRow label="MwSt-Code" value={inv.suggested_tax_code} />
+            <DataRow
+              label="Konto"
+              value={
+                inv.suggested_account_nr
+                  ? `${inv.suggested_account_nr}${
+                      inv.suggested_account_name
+                        ? ` ${inv.suggested_account_name}`
+                        : ""
+                    }`
+                  : "—"
+              }
+            />
+            <DataRow label="MwSt-Code" value={inv.suggested_tax_code || "—"} />
             <DataRow label="Faellig" value={formatDate(inv.due_date)} />
+            <DataRow
+              label="Konfidenz"
+              value={
+                inv.confidence_score !== null
+                  ? `${Math.round((inv.confidence_score || 0) * 100)}%`
+                  : "—"
+              }
+            />
           </div>
 
-          <div className="card p-5 space-y-3 text-sm">
-            <h3 className="font-medium">Zahlungs-Info</h3>
-            <DataRow label="IBAN" value={inv.iban} mono />
-            <DataRow label="QR-Ref" value={inv.reference_number ? `…${inv.reference_number.slice(-7)}` : "—"} mono />
-            <DataRow label="UID-Nr" value={inv.uid_number} mono />
-          </div>
+          {(inv.iban || inv.reference_number || inv.uid_number) && (
+            <div className="card p-5 space-y-3 text-sm">
+              <h3 className="font-medium">Zahlungs-Info</h3>
+              {inv.iban && <DataRow label="IBAN" value={inv.iban} mono />}
+              {inv.reference_number && (
+                <DataRow
+                  label="QR-Ref"
+                  value={`…${inv.reference_number.slice(-7)}`}
+                  mono
+                />
+              )}
+              {inv.uid_number && (
+                <DataRow label="UID-Nr" value={inv.uid_number} mono />
+              )}
+            </div>
+          )}
 
           <div className="card p-5 space-y-3 text-sm">
             <h3 className="font-medium">Quelle</h3>
-            <DataRow label="Eingang" value={inv.source === "imap" ? "Mail-Inbox" : inv.source === "telegram" ? "Telegram" : inv.source} />
+            <DataRow
+              label="Eingang"
+              value={
+                inv.source === "imap"
+                  ? "Mail-Inbox"
+                  : inv.source === "telegram"
+                  ? "Telegram"
+                  : inv.source || "—"
+              }
+            />
+            <DataRow label="Erfasst" value={formatDate(inv.created_at)} />
+            {inv.bexio_booked_at && (
+              <DataRow
+                label="In Bexio gebucht"
+                value={formatDate(inv.bexio_booked_at)}
+              />
+            )}
           </div>
+
+          {inv.error_message && (
+            <div className="card p-5 border-danger/50">
+              <h3 className="font-medium text-danger">Fehler</h3>
+              <p className="mt-1 text-sm text-foreground-muted break-words">
+                {inv.error_message}
+              </p>
+            </div>
+          )}
         </div>
       </div>
     </div>
   );
 }
 
-function DataRow({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
+function DataRow({
+  label,
+  value,
+  mono,
+}: {
+  label: string;
+  value: string;
+  mono?: boolean;
+}) {
   return (
     <div className="flex justify-between gap-4">
-      <span className="text-foreground-muted">{label}</span>
-      <span className={cn("text-right truncate", mono && "font-mono text-xs")}>{value}</span>
+      <span className="text-foreground-muted shrink-0">{label}</span>
+      <span
+        className={cn("text-right truncate", mono && "font-mono text-xs")}
+        title={value}
+      >
+        {value}
+      </span>
     </div>
   );
 }

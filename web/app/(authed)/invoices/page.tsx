@@ -1,18 +1,34 @@
 import Link from "next/link";
-import { Search, Filter } from "lucide-react";
+import { Search, FileText } from "lucide-react";
 import { formatCHF, formatDate, statusVariant, cn } from "@/lib/utils";
+import { listInvoices } from "@/lib/queries";
 
-// MOCK
-const MOCK_INVOICES = [
-  { id: "1", vendor_name: "SwissPlakat AG", invoice_number: "INV-2026-001", total_amount: 659.40, invoice_date: "2026-04-25", due_date: "2026-05-25", status: "booked" },
-  { id: "2", vendor_name: "Swisscom (Schweiz) AG", invoice_number: "8475-29371", total_amount: 89.00, invoice_date: "2026-04-22", due_date: "2026-05-22", status: "booked" },
-  { id: "3", vendor_name: "Aesthetikoase Landa", invoice_number: "RE2026-04637", total_amount: 918.85, invoice_date: "2026-04-20", due_date: "2026-05-20", status: "awaiting_approval" },
-  { id: "4", vendor_name: "Migros", invoice_number: "—", total_amount: 47.30, invoice_date: "2026-04-18", due_date: null, status: "booked_private" },
-  { id: "5", vendor_name: "Hostpoint AG", invoice_number: "IN-2026-1882", total_amount: 204.00, invoice_date: "2026-04-15", due_date: "2026-05-15", status: "booked" },
-  { id: "6", vendor_name: "Wagner Roger", invoice_number: "KA-00212", total_amount: 0, invoice_date: "2026-03-17", due_date: null, status: "rejected" },
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
+
+const STATUS_FILTERS = [
+  { value: "", label: "Alle" },
+  { value: "awaiting_approval", label: "Wartet" },
+  { value: "extracted", label: "Wartet" },
+  { value: "booked", label: "Gebucht" },
+  { value: "booked_private", label: "Privat" },
+  { value: "failed", label: "Fehler" },
 ];
 
-export default function InvoicesPage() {
+export default async function InvoicesPage({
+  searchParams,
+}: {
+  searchParams: { status?: string; q?: string };
+}) {
+  const status = searchParams.status || "";
+  const search = searchParams.q || "";
+
+  const invoices = await listInvoices({
+    status: status || undefined,
+    search: search || undefined,
+    limit: 200,
+  });
+
   return (
     <div className="space-y-6">
       <div>
@@ -23,72 +39,113 @@ export default function InvoicesPage() {
       </div>
 
       {/* Filters */}
-      <div className="flex items-center gap-3">
+      <form className="flex items-center gap-3 flex-wrap" action="/invoices">
         <div className="relative flex-1 max-w-md">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-foreground-subtle" />
           <input
             type="text"
+            name="q"
             placeholder="Suche nach Lieferant oder Nummer…"
             className="input pl-9"
-            disabled
+            defaultValue={search}
           />
         </div>
-        <button className="btn-secondary text-sm" disabled>
-          <Filter className="w-4 h-4" />
-          Status: Alle
-        </button>
-      </div>
+        <div className="flex items-center gap-1">
+          {STATUS_FILTERS.filter(
+            (f, i, arr) => arr.findIndex((a) => a.label === f.label) === i,
+          ).map((f) => {
+            const isActive =
+              (f.value === "" && !status) ||
+              status === f.value ||
+              (f.label === "Wartet" &&
+                ["awaiting_approval", "extracted"].includes(status));
+            const href = f.value
+              ? `/invoices?status=${f.value}${search ? `&q=${encodeURIComponent(search)}` : ""}`
+              : `/invoices${search ? `?q=${encodeURIComponent(search)}` : ""}`;
+            return (
+              <Link
+                key={f.label}
+                href={href}
+                className={cn(
+                  "px-3 py-1.5 rounded-md text-sm transition-colors",
+                  isActive
+                    ? "bg-primary text-primary-fg"
+                    : "text-foreground-muted hover:bg-background-card hover:text-foreground",
+                )}
+              >
+                {f.label}
+              </Link>
+            );
+          })}
+        </div>
+      </form>
 
       {/* Table */}
-      <div className="card overflow-hidden">
-        <table className="w-full text-sm">
-          <thead className="bg-background border-b border-border">
-            <tr className="text-left text-foreground-muted text-xs uppercase tracking-wide">
-              <th className="px-6 py-3 font-medium">Lieferant</th>
-              <th className="px-6 py-3 font-medium">Nummer</th>
-              <th className="px-6 py-3 font-medium">Datum</th>
-              <th className="px-6 py-3 font-medium">Faellig</th>
-              <th className="px-6 py-3 font-medium text-right">Betrag</th>
-              <th className="px-6 py-3 font-medium">Status</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-border">
-            {MOCK_INVOICES.map((inv) => {
-              const variant = statusVariant(inv.status);
-              return (
-                <tr key={inv.id} className="hover:bg-background">
-                  <td className="px-6 py-3">
-                    <Link href={`/invoices/${inv.id}`} className="font-medium hover:underline">
-                      {inv.vendor_name}
-                    </Link>
-                  </td>
-                  <td className="px-6 py-3 text-foreground-muted text-xs font-mono">
-                    {inv.invoice_number}
-                  </td>
-                  <td className="px-6 py-3 text-foreground-muted">
-                    {formatDate(inv.invoice_date)}
-                  </td>
-                  <td className="px-6 py-3 text-foreground-muted">
-                    {formatDate(inv.due_date)}
-                  </td>
-                  <td className="px-6 py-3 text-right font-medium">
-                    {inv.status === "rejected" ? "—" : formatCHF(inv.total_amount)}
-                  </td>
-                  <td className="px-6 py-3">
-                    <span className={cn("badge", variant.className)}>
-                      {variant.label}
-                    </span>
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
-
-      <div className="text-xs text-foreground-muted text-center">
-        Mock-Daten. Live-Anbindung via Supabase folgt in Block 1D.
-      </div>
+      {invoices.length === 0 ? (
+        <div className="card py-16 text-center">
+          <FileText className="w-10 h-10 mx-auto text-foreground-subtle" />
+          <h3 className="mt-3 font-medium">
+            {search || status ? "Keine Treffer" : "Noch keine Belege"}
+          </h3>
+          <p className="mt-1 text-sm text-foreground-muted">
+            {search || status
+              ? "Versuche andere Filter oder Suche."
+              : "Schicke einen Beleg per Telegram oder konfiguriere die Mailbox."}
+          </p>
+        </div>
+      ) : (
+        <div className="card overflow-hidden">
+          <table className="w-full text-sm">
+            <thead className="bg-background border-b border-border">
+              <tr className="text-left text-foreground-muted text-xs uppercase tracking-wide">
+                <th className="px-6 py-3 font-medium">Lieferant</th>
+                <th className="px-6 py-3 font-medium">Nummer</th>
+                <th className="px-6 py-3 font-medium">Datum</th>
+                <th className="px-6 py-3 font-medium">Faellig</th>
+                <th className="px-6 py-3 font-medium text-right">Betrag</th>
+                <th className="px-6 py-3 font-medium">Status</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-border">
+              {invoices.map((inv) => {
+                const variant = statusVariant(inv.status);
+                return (
+                  <tr key={inv.id} className="hover:bg-background">
+                    <td className="px-6 py-3">
+                      <Link
+                        href={`/invoices/${inv.id}`}
+                        className="font-medium hover:underline"
+                      >
+                        {inv.vendor_name || "—"}
+                      </Link>
+                    </td>
+                    <td className="px-6 py-3 text-foreground-muted text-xs font-mono">
+                      {inv.invoice_number || "—"}
+                    </td>
+                    <td className="px-6 py-3 text-foreground-muted">
+                      {formatDate(inv.invoice_date)}
+                    </td>
+                    <td className="px-6 py-3 text-foreground-muted">
+                      {formatDate(inv.due_date)}
+                    </td>
+                    <td className="px-6 py-3 text-right font-medium">
+                      {formatCHF(inv.total_amount)}
+                    </td>
+                    <td className="px-6 py-3">
+                      <span className={cn("badge", variant.className)}>
+                        {variant.label}
+                      </span>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+          <div className="px-6 py-3 text-xs text-foreground-muted bg-background border-t border-border">
+            {invoices.length} Belege
+          </div>
+        </div>
+      )}
     </div>
   );
 }
