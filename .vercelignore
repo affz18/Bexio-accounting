@@ -1,0 +1,21 @@
+# Vercel deployt NUR die Next.js-App in web/.
+# Der Python-Bot (app/, requirements.txt, etc.) laeuft auf Railway,
+# nicht auf Vercel. Diese Datei verhindert dass Vercel den Python-Code
+# scannt und einen falschen Auto-Detect-Build versucht.
+#
+# WICHTIG: in Vercel Project Settings > General > Root Directory
+# muss "web" eingetragen sein. Diese Datei ist nur ein Backup.
+
+app/
+tests/
+migrations/
+*.py
+requirements.txt
+pyproject.toml
+Procfile
+railway.json
+.env
+.env.example
+__pycache__/
+.pytest_cache/
+*.pyc
