@@ -10,7 +10,7 @@ from supabase import create_client, Client
 
 from app.config import settings
 from app.utils import setup_logger, normalize_vendor_name
-from app.models import VendorMemory
+from app.models import VendorMemory, Tenant
 
 
 logger = setup_logger(__name__)
@@ -992,3 +992,91 @@ def get_payment_match(match_id: str) -> Optional[Dict[str, Any]]:
     except Exception as e:
         logger.error(f"Fehler beim Laden Payment-Match {match_id}: {e}")
         return None
+
+
+# =========================================================
+# TENANTS (Multi-Tenant Foundation - Phase B1)
+# =========================================================
+#
+# Diese Helpers lesen die tenants-Tabelle. In Phase B1 hat das System nur
+# den Default-Tenant 'visioskin'. Die get-Funktionen sind cached weil
+# Tenant-Daten sich quasi nie aendern.
+
+# Default-Tenant-ID (aus Migration 003 - der einzige Tenant der hier am
+# Start existiert). Code der einen Tenant-Kontext braucht, aber noch nicht
+# Multi-Tenant-faehig ist, kann diese ID nehmen.
+DEFAULT_TENANT_ID = "visioskin"
+
+_tenant_cache: Dict[str, Tenant] = {}
+
+
+def get_tenant(tenant_id: str = DEFAULT_TENANT_ID) -> Optional[Tenant]:
+    """
+    Holt einen Tenant aus der DB. Cached pro Prozess-Lifetime.
+    Returns None wenn der Tenant nicht existiert oder inaktiv ist.
+    """
+    if tenant_id in _tenant_cache:
+        return _tenant_cache[tenant_id]
+    try:
+        result = (
+            get_client()
+            .table("tenants")
+            .select("*")
+            .eq("id", tenant_id)
+            .eq("is_active", True)
+            .limit(1)
+            .execute()
+        )
+        if not result.data:
+            return None
+        tenant = Tenant(**result.data[0])
+        _tenant_cache[tenant_id] = tenant
+        return tenant
+    except Exception as e:
+        logger.error(f"Fehler beim Laden Tenant {tenant_id}: {e}")
+        return None
+
+
+def list_tenants(only_active: bool = True) -> List[Tenant]:
+    """Listet alle Tenants. Nuetzlich fuer Background-Tasks (z.B. IMAP-Scan
+    fuer alle aktiven Tenants)."""
+    try:
+        query = get_client().table("tenants").select("*")
+        if only_active:
+            query = query.eq("is_active", True)
+        result = query.order("id").execute()
+        return [Tenant(**t) for t in (result.data or [])]
+    except Exception as e:
+        logger.error(f"Fehler beim Listen Tenants: {e}")
+        return []
+
+
+def resolve_tenant_for_chat(telegram_chat_id: int) -> Optional[str]:
+    """
+    Findet den Tenant zu einer Telegram-Chat-ID via authorized_users.
+    Falls der Chat in mehreren Tenants ist (selten), nimmt den ersten -
+    spaeter koennten wir hier explizite Auswahl machen.
+
+    Returns: tenant_id oder None wenn unauthorized.
+    """
+    try:
+        result = (
+            get_client()
+            .table("authorized_users")
+            .select("tenant_id")
+            .eq("telegram_chat_id", telegram_chat_id)
+            .limit(1)
+            .execute()
+        )
+        if result.data:
+            return result.data[0].get("tenant_id") or DEFAULT_TENANT_ID
+        return None
+    except Exception as e:
+        logger.error(f"Tenant-Resolution fuer Chat {telegram_chat_id} fehlgeschlagen: {e}")
+        return None
+
+
+def clear_tenant_cache() -> None:
+    """Leert den Tenant-Cache. Aufrufen wenn Tenant-Daten geaendert wurden."""
+    global _tenant_cache
+    _tenant_cache = {}
